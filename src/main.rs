@@ -1,5 +1,9 @@
 use minifb::{Key, Window, WindowOptions};
 use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 // Grid dimensions (matches original game)
@@ -12,9 +16,22 @@ const CELL_SIZE: usize = 16;
 // Pin layout: 3x3 pins, left at x=1, right at x=40
 const PIN_SIZE: usize = 3;
 
-// Window size is just the grid
-const WINDOW_WIDTH: usize = GRID_WIDTH * CELL_SIZE;
-const WINDOW_HEIGHT: usize = GRID_HEIGHT * CELL_SIZE;
+// UI Panel on right side
+const PANEL_WIDTH: usize = 80;
+const BUTTON_HEIGHT: usize = 44;
+const BUTTON_MARGIN: usize = 4;
+
+// Bottom area for help text, tabs, and content panel
+const HELP_AREA_HEIGHT: usize = 20;
+const TAB_HEIGHT: usize = 24;
+const TAB_CONTENT_HEIGHT: usize = 120;  // Content area below tabs
+const BOTTOM_AREA_HEIGHT: usize = HELP_AREA_HEIGHT + TAB_HEIGHT + TAB_CONTENT_HEIGHT;
+
+// Window size includes grid + panel + bottom area
+const GRID_PIXEL_WIDTH: usize = GRID_WIDTH * CELL_SIZE;
+const GRID_PIXEL_HEIGHT: usize = GRID_HEIGHT * CELL_SIZE;
+const WINDOW_WIDTH: usize = GRID_PIXEL_WIDTH + PANEL_WIDTH;
+const WINDOW_HEIGHT: usize = GRID_PIXEL_HEIGHT + BOTTOM_AREA_HEIGHT;
 
 // Colors (0xRRGGBB format)
 const COLOR_BACKGROUND: u32 = 0x4a4a4a;
@@ -45,6 +62,22 @@ const COLOR_SELECTION: u32 = 0x0066ff;    // Blue selection
 const COLOR_PATH_PREVIEW: u32 = 0xffffff; // White path preview
 const COLOR_SOURCE_POINT: u32 = 0xff00ff; // Magenta source point
 
+// Panel colors
+const COLOR_PANEL_BG: u32 = 0x606060;     // Panel background
+const COLOR_BUTTON_BG: u32 = 0x808080;    // Button background
+const COLOR_BUTTON_LIGHT: u32 = 0xa0a0a0; // Button highlight edge
+const COLOR_BUTTON_DARK: u32 = 0x505050;  // Button shadow edge
+const COLOR_BUTTON_ACTIVE: u32 = 0x993333; // Active button border (red)
+const COLOR_BUTTON_TEXT: u32 = 0x000000;  // Button text
+const COLOR_DELETE_X: u32 = 0xcc3333;     // Red X for delete buttons
+
+// Bottom area colors
+const COLOR_HELP_BG: u32 = 0x505050;      // Help area background
+const COLOR_HELP_TEXT: u32 = 0xcccccc;    // Help text color
+const COLOR_TAB_BG: u32 = 0x707070;       // Inactive tab background
+const COLOR_TAB_ACTIVE_BG: u32 = 0x909090; // Active tab background
+const COLOR_TAB_TEXT: u32 = 0x000000;     // Tab text color
+
 // Key repeat timing (in milliseconds)
 const KEY_REPEAT_DELAY_MS: u64 = 400;  // Initial delay before repeat starts
 const KEY_REPEAT_RATE_MS: u64 = 50;    // Rate of repeat once started
@@ -64,6 +97,7 @@ enum EditMode {
     DeleteSilicon, // 6 - Delete silicon and via
     DeleteAll,     // 7 - Delete everything
     Visual,        // 8 - Vim-like visual mode
+    MouseSelect,   // 9 - Mouse-based selection mode
 }
 
 /// Visual mode sub-states
@@ -71,15 +105,59 @@ enum EditMode {
 enum VisualState {
     Normal,        // Just cursor, no selection
     Selecting,     // 'v' pressed, selecting area
-    PlacingN,      // '+' then 'n' or just in N mode - placing N silicon
+    PlacingN,      // '-' pressed - placing N silicon
     PlacingP,      // '+' pressed - placing P silicon
     PlacingMetal,  // '=' pressed - placing metal
+}
+
+/// Pending prefix modifier for visual mode commands
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingModifier {
+    None,
+    Silicon,  // 's' - filter to silicon
+    Metal,    // 'm' - filter to metal
+    Goto,     // 'g' - goto prefix
+}
+
+/// Bottom tabs
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    Specifications,
+    Verification,
+    DesignSnippets,
+    Designs,
+    Help,
+    Menu,
+}
+
+/// Dialog state for text input
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DialogState {
+    None,
+    SaveSnippet { name: String },  // Entering name for a new snippet
+}
+
+/// A saved design snippet - a rectangular region of circuit
+#[derive(Clone)]
+struct Snippet {
+    name: String,
+    width: usize,
+    height: usize,
+    // Stored as relative coordinates from top-left
+    nodes: Vec<Vec<Node>>,
+    // Horizontal edges (width-1 x height)
+    h_edges: Vec<Vec<Edge>>,
+    // Vertical edges (width x height-1)
+    v_edges: Vec<Vec<Edge>>,
 }
 
 /// Editor state for construction
 struct EditorState {
     mode: EditMode,
     visual_state: VisualState,
+    pending_modifier: PendingModifier,
+    active_tab: Tab,
+    dialog: DialogState,
 
     // Cursor position (grid coordinates)
     cursor_x: usize,
@@ -88,6 +166,9 @@ struct EditorState {
     // Selection anchor (for visual mode)
     selection_anchor: Option<(usize, usize)>,
 
+    // Mouse selection end point (for finalized mouse selections in mode 9)
+    mouse_selection_end: Option<(usize, usize)>,
+
     // Path construction state (for mouse-based modes)
     path_start: Option<(usize, usize)>,
     current_path: Vec<(usize, usize)>,
@@ -95,29 +176,52 @@ struct EditorState {
     // Mouse position (grid coordinates)
     mouse_grid_x: Option<usize>,
     mouse_grid_y: Option<usize>,
+
+    // Snippets
+    snippets: Vec<Snippet>,
+    selected_snippet: usize,
+    snippets_dir: PathBuf,
+
+    // Yank buffer for paste operations
+    yank_buffer: Option<Snippet>,
 }
 
 impl EditorState {
-    fn new() -> Self {
+    fn new(snippets_dir: PathBuf) -> Self {
         Self {
             mode: EditMode::Visual,  // Start in visual mode
             visual_state: VisualState::Normal,
+            pending_modifier: PendingModifier::None,
+            active_tab: Tab::Help,   // Start on Help tab
+            dialog: DialogState::None,
             cursor_x: GRID_WIDTH / 2,
             cursor_y: GRID_HEIGHT / 2,
             selection_anchor: None,
+            mouse_selection_end: None,
             path_start: None,
             current_path: Vec::new(),
             mouse_grid_x: None,
             mouse_grid_y: None,
+            snippets: Vec::new(),
+            selected_snippet: 0,
+            snippets_dir,
+            yank_buffer: None,
         }
+    }
+
+    fn clear_modifier(&mut self) {
+        self.pending_modifier = PendingModifier::None;
     }
 
     fn get_selection(&self) -> Option<(usize, usize, usize, usize)> {
         if let Some((ax, ay)) = self.selection_anchor {
-            let min_x = ax.min(self.cursor_x);
-            let max_x = ax.max(self.cursor_x);
-            let min_y = ay.min(self.cursor_y);
-            let max_y = ay.max(self.cursor_y);
+            // For finalized mouse selection, use stored end point
+            // Otherwise use current cursor position
+            let (bx, by) = self.mouse_selection_end.unwrap_or((self.cursor_x, self.cursor_y));
+            let min_x = ax.min(bx);
+            let max_x = ax.max(bx);
+            let min_y = ay.min(by);
+            let max_y = ay.max(by);
             Some((min_x, min_y, max_x, max_y))
         } else {
             None
@@ -578,6 +682,64 @@ fn delete_silicon(circuit: &mut Circuit, x: usize, y: usize) {
         circuit.set_edge(x, y, x, y + 1, Layer::NSilicon, false);
         circuit.set_edge(x, y, x, y + 1, Layer::PSilicon, false);
     }
+
+    // Check neighboring gates for validity
+    validate_neighboring_gates(circuit, x, y);
+}
+
+/// Check if a gate at position (x, y) is still valid, and if not, convert it to its channel type
+fn validate_gate(circuit: &mut Circuit, x: usize, y: usize) {
+    let channel = match circuit.get_node(x, y) {
+        Some(node) => match node.silicon {
+            Silicon::Gate { channel } => channel,
+            _ => return, // Not a gate, nothing to validate
+        },
+        None => return,
+    };
+
+    // Check if the channel still has through connections (both ends)
+    let layer = match channel {
+        SiliconKind::N => Layer::NSilicon,
+        SiliconKind::P => Layer::PSilicon,
+    };
+
+    let conn_left = circuit.is_connected(x, y, Direction::Left, layer);
+    let conn_right = circuit.is_connected(x, y, Direction::Right, layer);
+    let conn_up = circuit.is_connected(x, y, Direction::Up, layer);
+    let conn_down = circuit.is_connected(x, y, Direction::Down, layer);
+
+    let horizontal_through = conn_left && conn_right;
+    let vertical_through = conn_up && conn_down;
+
+    // Gate is valid if channel has through connection in exactly one axis
+    let is_valid = (horizontal_through && !conn_up && !conn_down)
+        || (vertical_through && !conn_left && !conn_right);
+
+    if !is_valid {
+        // Convert gate back to channel type
+        if let Some(node) = circuit.get_node_mut(x, y) {
+            node.silicon = match channel {
+                SiliconKind::N => Silicon::N,
+                SiliconKind::P => Silicon::P,
+            };
+        }
+    }
+}
+
+/// Check all neighbors of a position for invalid gates
+fn validate_neighboring_gates(circuit: &mut Circuit, x: usize, y: usize) {
+    if x > 0 {
+        validate_gate(circuit, x - 1, y);
+    }
+    if x < GRID_WIDTH - 1 {
+        validate_gate(circuit, x + 1, y);
+    }
+    if y > 0 {
+        validate_gate(circuit, x, y - 1);
+    }
+    if y < GRID_HEIGHT - 1 {
+        validate_gate(circuit, x, y + 1);
+    }
 }
 
 /// Delete everything at a position
@@ -601,14 +763,381 @@ fn delete_region(circuit: &mut Circuit, x1: usize, y1: usize, x2: usize, y2: usi
     }
 }
 
+/// Yank (copy) a rectangular region into a snippet
+fn yank_region(circuit: &Circuit, x1: usize, y1: usize, x2: usize, y2: usize, name: String) -> Snippet {
+    let width = x2 - x1 + 1;
+    let height = y2 - y1 + 1;
+
+    // Copy nodes
+    let mut nodes = Vec::with_capacity(height);
+    for y in y1..=y2 {
+        let mut row = Vec::with_capacity(width);
+        for x in x1..=x2 {
+            if let Some(node) = circuit.get_node(x, y) {
+                row.push(*node);
+            } else {
+                row.push(Node::default());
+            }
+        }
+        nodes.push(row);
+    }
+
+    // Copy horizontal edges (connections between adjacent cells in same row)
+    let mut h_edges = Vec::with_capacity(height);
+    for y in y1..=y2 {
+        let mut row = Vec::with_capacity(width.saturating_sub(1));
+        for x in x1..x2 {
+            let edge = circuit.get_edge(x, y, x + 1, y).copied().unwrap_or_default();
+            row.push(edge);
+        }
+        h_edges.push(row);
+    }
+
+    // Copy vertical edges (connections between adjacent cells in same column)
+    let mut v_edges = Vec::with_capacity(height.saturating_sub(1));
+    for y in y1..y2 {
+        let mut row = Vec::with_capacity(width);
+        for x in x1..=x2 {
+            let edge = circuit.get_edge(x, y, x, y + 1).copied().unwrap_or_default();
+            row.push(edge);
+        }
+        v_edges.push(row);
+    }
+
+    Snippet {
+        name,
+        width,
+        height,
+        nodes,
+        h_edges,
+        v_edges,
+    }
+}
+
+/// Rotate a snippet 90 degrees clockwise
+fn rotate_snippet(snippet: &Snippet) -> Snippet {
+    let old_w = snippet.width;
+    let old_h = snippet.height;
+    let new_w = old_h;
+    let new_h = old_w;
+
+    // Rotate nodes: new[x][y] = old[old_h - 1 - y][x]
+    let mut new_nodes = vec![vec![Node::default(); new_w]; new_h];
+    for old_y in 0..old_h {
+        for old_x in 0..old_w {
+            let new_x = old_h - 1 - old_y;
+            let new_y = old_x;
+            if new_y < new_h && new_x < new_w {
+                new_nodes[new_y][new_x] = snippet.nodes[old_y][old_x];
+            }
+        }
+    }
+
+    // Rotate horizontal edges -> become vertical edges
+    // old h_edges: (old_w - 1) x old_h -> new v_edges: new_w x (new_h - 1)
+    let mut new_v_edges = vec![vec![Edge::default(); new_w]; new_h.saturating_sub(1)];
+    for old_y in 0..old_h {
+        for old_x in 0..old_w.saturating_sub(1) {
+            let new_x = old_h - 1 - old_y;
+            let new_y = old_x; // This becomes the top of the vertical edge
+            if new_y < new_h.saturating_sub(1) && new_x < new_w {
+                new_v_edges[new_y][new_x] = snippet.h_edges.get(old_y).and_then(|r| r.get(old_x)).copied().unwrap_or_default();
+            }
+        }
+    }
+
+    // Rotate vertical edges -> become horizontal edges
+    // old v_edges: old_w x (old_h - 1) -> new h_edges: (new_w - 1) x new_h
+    let mut new_h_edges = vec![vec![Edge::default(); new_w.saturating_sub(1)]; new_h];
+    for old_y in 0..old_h.saturating_sub(1) {
+        for old_x in 0..old_w {
+            // Vertical edge from (old_x, old_y) to (old_x, old_y+1)
+            // After rotation: becomes horizontal edge from (new_x, new_y) to (new_x+1, new_y)
+            // where new_x = old_h - 1 - old_y - 1 = old_h - 2 - old_y (since edge connects old_y to old_y+1)
+            let new_x = old_h - 2 - old_y;
+            let new_y = old_x;
+            if new_y < new_h && new_x < new_w.saturating_sub(1) {
+                new_h_edges[new_y][new_x] = snippet.v_edges.get(old_y).and_then(|r| r.get(old_x)).copied().unwrap_or_default();
+            }
+        }
+    }
+
+    Snippet {
+        name: snippet.name.clone(),
+        width: new_w,
+        height: new_h,
+        nodes: new_nodes,
+        h_edges: new_h_edges,
+        v_edges: new_v_edges,
+    }
+}
+
+fn paste_snippet(circuit: &mut Circuit, snippet: &Snippet, dest_x: usize, dest_y: usize) {
+    // Paste nodes
+    for (sy, row) in snippet.nodes.iter().enumerate() {
+        for (sx, node) in row.iter().enumerate() {
+            let x = dest_x + sx;
+            let y = dest_y + sy;
+            if x < GRID_WIDTH && y < GRID_HEIGHT && is_playable(x, y) {
+                if let Some(dest_node) = circuit.get_node_mut(x, y) {
+                    *dest_node = *node;
+                }
+            }
+        }
+    }
+
+    // Paste horizontal edges
+    for (sy, row) in snippet.h_edges.iter().enumerate() {
+        for (sx, edge) in row.iter().enumerate() {
+            let x = dest_x + sx;
+            let y = dest_y + sy;
+            if x + 1 < GRID_WIDTH && y < GRID_HEIGHT {
+                if let Some(dest_edge) = circuit.get_edge_mut(x, y, x + 1, y) {
+                    *dest_edge = *edge;
+                }
+            }
+        }
+    }
+
+    // Paste vertical edges
+    for (sy, row) in snippet.v_edges.iter().enumerate() {
+        for (sx, edge) in row.iter().enumerate() {
+            let x = dest_x + sx;
+            let y = dest_y + sy;
+            if x < GRID_WIDTH && y + 1 < GRID_HEIGHT {
+                if let Some(dest_edge) = circuit.get_edge_mut(x, y, x, y + 1) {
+                    *dest_edge = *edge;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Snippet Persistence
+// ============================================================================
+
+/// Save a snippet to a file in the snippets directory
+fn save_snippet_to_file(snippet: &Snippet, dir: &PathBuf) -> std::io::Result<()> {
+    // Create directory if it doesn't exist
+    fs::create_dir_all(dir)?;
+
+    // Sanitize filename (replace invalid chars with _)
+    let safe_name: String = snippet.name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let filename = format!("{}.snip", safe_name);
+    let path = dir.join(&filename);
+
+    let mut file = fs::File::create(&path)?;
+
+    // Write header
+    writeln!(file, "CXEMA_SNIPPET")?;
+    writeln!(file, "name:{}", snippet.name)?;
+    writeln!(file, "size:{}x{}", snippet.width, snippet.height)?;
+
+    // Write nodes
+    writeln!(file, "nodes:")?;
+    for row in &snippet.nodes {
+        let line: String = row.iter().map(|node| {
+            let si = match node.silicon {
+                Silicon::None => '.',
+                Silicon::N => 'n',
+                Silicon::P => 'p',
+                Silicon::Gate { channel: SiliconKind::N } => 'N',
+                Silicon::Gate { channel: SiliconKind::P } => 'G',
+            };
+            let vi = if node.via { 'v' } else { '.' };
+            let me = if node.metal { 'm' } else { '.' };
+            format!("{}{}{}", si, vi, me)
+        }).collect::<Vec<_>>().join(",");
+        writeln!(file, "{}", line)?;
+    }
+
+    // Write horizontal edges
+    writeln!(file, "h_edges:")?;
+    for row in &snippet.h_edges {
+        let line: String = row.iter().map(|edge| {
+            let n = if edge.n_silicon { 'n' } else { '.' };
+            let p = if edge.p_silicon { 'p' } else { '.' };
+            let m = if edge.metal { 'm' } else { '.' };
+            format!("{}{}{}", n, p, m)
+        }).collect::<Vec<_>>().join(",");
+        writeln!(file, "{}", line)?;
+    }
+
+    // Write vertical edges
+    writeln!(file, "v_edges:")?;
+    for row in &snippet.v_edges {
+        let line: String = row.iter().map(|edge| {
+            let n = if edge.n_silicon { 'n' } else { '.' };
+            let p = if edge.p_silicon { 'p' } else { '.' };
+            let m = if edge.metal { 'm' } else { '.' };
+            format!("{}{}{}", n, p, m)
+        }).collect::<Vec<_>>().join(",");
+        writeln!(file, "{}", line)?;
+    }
+
+    Ok(())
+}
+
+/// Load a snippet from a file
+fn load_snippet_from_file(path: &PathBuf) -> std::io::Result<Snippet> {
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    // Check header
+    let header = lines.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Empty file"))??;
+    if header != "CXEMA_SNIPPET" {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid snippet file"));
+    }
+
+    // Parse name
+    let name_line = lines.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing name"))??;
+    let name = name_line.strip_prefix("name:").unwrap_or("unnamed").to_string();
+
+    // Parse size
+    let size_line = lines.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing size"))??;
+    let size_str = size_line.strip_prefix("size:").unwrap_or("1x1");
+    let mut size_parts = size_str.split('x');
+    let width: usize = size_parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let height: usize = size_parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+
+    // Skip "nodes:" line
+    lines.next();
+
+    // Parse nodes
+    let mut nodes = Vec::new();
+    for _ in 0..height {
+        if let Some(Ok(line)) = lines.next() {
+            let row: Vec<Node> = line.split(',').map(|cell| {
+                let chars: Vec<char> = cell.chars().collect();
+                let silicon = match chars.get(0) {
+                    Some('n') => Silicon::N,
+                    Some('p') => Silicon::P,
+                    Some('N') => Silicon::Gate { channel: SiliconKind::N },
+                    Some('G') => Silicon::Gate { channel: SiliconKind::P },
+                    _ => Silicon::None,
+                };
+                let via = chars.get(1) == Some(&'v');
+                let metal = chars.get(2) == Some(&'m');
+                Node { silicon, via, metal }
+            }).collect();
+            nodes.push(row);
+        }
+    }
+
+    // Skip "h_edges:" line
+    lines.next();
+
+    // Parse horizontal edges
+    let mut h_edges = Vec::new();
+    for _ in 0..height {
+        if let Some(Ok(line)) = lines.next() {
+            if line.is_empty() {
+                h_edges.push(Vec::new());
+            } else {
+                let row: Vec<Edge> = line.split(',').map(|cell| {
+                    let chars: Vec<char> = cell.chars().collect();
+                    Edge {
+                        n_silicon: chars.get(0) == Some(&'n'),
+                        p_silicon: chars.get(1) == Some(&'p'),
+                        metal: chars.get(2) == Some(&'m'),
+                    }
+                }).collect();
+                h_edges.push(row);
+            }
+        }
+    }
+
+    // Skip "v_edges:" line
+    lines.next();
+
+    // Parse vertical edges
+    let mut v_edges = Vec::new();
+    for _ in 0..height.saturating_sub(1) {
+        if let Some(Ok(line)) = lines.next() {
+            if line.is_empty() {
+                v_edges.push(Vec::new());
+            } else {
+                let row: Vec<Edge> = line.split(',').map(|cell| {
+                    let chars: Vec<char> = cell.chars().collect();
+                    Edge {
+                        n_silicon: chars.get(0) == Some(&'n'),
+                        p_silicon: chars.get(1) == Some(&'p'),
+                        metal: chars.get(2) == Some(&'m'),
+                    }
+                }).collect();
+                v_edges.push(row);
+            }
+        }
+    }
+
+    Ok(Snippet {
+        name,
+        width,
+        height,
+        nodes,
+        h_edges,
+        v_edges,
+    })
+}
+
+/// Load all snippets from the snippets directory
+fn load_all_snippets(dir: &PathBuf) -> Vec<Snippet> {
+    let mut snippets = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "snip").unwrap_or(false) {
+                if let Ok(snippet) = load_snippet_from_file(&path) {
+                    snippets.push(snippet);
+                }
+            }
+        }
+    }
+
+    // Sort by name
+    snippets.sort_by(|a, b| a.name.cmp(&b.name));
+    snippets
+}
+
+/// Delete a snippet file from the snippets directory
+fn delete_snippet_file(snippet: &Snippet, dir: &PathBuf) -> std::io::Result<()> {
+    // Generate the same filename as save_snippet_to_file
+    let safe_name: String = snippet.name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let filename = format!("{}.snip", safe_name);
+    let path = dir.join(&filename);
+
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Main
 // ============================================================================
 
 fn main() {
+    // Parse command line arguments
+    let args: Vec<String> = env::args().collect();
+    let snippets_dir = if args.len() > 1 {
+        PathBuf::from(&args[1])
+    } else {
+        PathBuf::from(".snippits")
+    };
+
     let mut buffer: Vec<u32> = vec![0; WINDOW_WIDTH * WINDOW_HEIGHT];
     let mut circuit = Circuit::new();
-    let mut editor = EditorState::new();
+    let mut editor = EditorState::new(snippets_dir.clone());
+
+    // Load existing snippets from disk
+    editor.snippets = load_all_snippets(&snippets_dir);
 
     // Load font for pin labels
     let font = load_font("terminus/ter-u14b.bdf");
@@ -621,7 +1150,7 @@ fn main() {
     setup_test_pattern(&mut circuit);
 
     let mut window = Window::new(
-        "KOHCTPYKTOP: Engineer of the People",
+        "CXEMA",
         WINDOW_WIDTH,
         WINDOW_HEIGHT,
         WindowOptions {
@@ -703,13 +1232,51 @@ fn main() {
         // Handle input
         handle_input(&mut circuit, &mut editor, &new_keys, &window);
 
-        // Update mouse position
+        // Get current mouse button states
+        let left_down = window.get_mouse_down(minifb::MouseButton::Left);
+        let right_down = window.get_mouse_down(minifb::MouseButton::Right);
+
+        // Detect mouse button press (transition from not pressed to pressed)
+        let left_clicked = left_down && !prev_left_down;
+        let right_clicked = right_down && !prev_right_down;
+
+        // Update mouse position and handle clicks
         if let Some((mx, my)) = window.get_mouse_pos(minifb::MouseMode::Clamp) {
-            let grid_x = (mx as usize) / CELL_SIZE;
-            let grid_y = (my as usize) / CELL_SIZE;
+            let mx = mx as usize;
+            let my = my as usize;
+
+            // Check for panel button clicks first
+            if left_clicked && mx >= GRID_PIXEL_WIDTH {
+                if let Some(new_mode) = get_clicked_button(mx, my) {
+                    editor.mode = new_mode;
+                    editor.path_start = None;
+                    editor.current_path.clear();
+                    if new_mode == EditMode::Visual {
+                        editor.visual_state = VisualState::Normal;
+                        editor.selection_anchor = None;
+                    }
+                }
+            }
+
+            // Check for tab clicks
+            if left_clicked && my >= GRID_PIXEL_HEIGHT {
+                if let Some(tab) = get_clicked_tab(mx, my) {
+                    editor.active_tab = tab;
+                }
+            }
+
+            // Update grid position for non-panel area
+            let grid_x = mx / CELL_SIZE;
+            let grid_y = my / CELL_SIZE;
             if grid_x < GRID_WIDTH && grid_y < GRID_HEIGHT {
                 editor.mouse_grid_x = Some(grid_x);
                 editor.mouse_grid_y = Some(grid_y);
+
+                // In MouseSelect mode, cursor follows mouse (for easy paste positioning)
+                if editor.mode == EditMode::MouseSelect {
+                    editor.cursor_x = grid_x;
+                    editor.cursor_y = grid_y;
+                }
 
                 // Update path preview for mouse-based modes
                 if let Some(start) = editor.path_start {
@@ -721,18 +1288,13 @@ fn main() {
                     };
                     editor.current_path = find_path(start, (grid_x, grid_y), &circuit, layer);
                 }
+            } else {
+                editor.mouse_grid_x = None;
+                editor.mouse_grid_y = None;
             }
         }
 
-        // Get current mouse button states
-        let left_down = window.get_mouse_down(minifb::MouseButton::Left);
-        let right_down = window.get_mouse_down(minifb::MouseButton::Right);
-
-        // Detect mouse button press (transition from not pressed to pressed)
-        let left_clicked = left_down && !prev_left_down;
-        let right_clicked = right_down && !prev_right_down;
-
-        // Handle mouse clicks with debouncing
+        // Handle mouse clicks with debouncing (only for grid area)
         handle_mouse(&mut circuit, &mut editor, left_clicked, right_clicked, left_down, right_down);
 
         // Render
@@ -748,12 +1310,168 @@ fn main() {
     }
 }
 
+/// Convert a key to a character for text input
+fn key_to_char(key: Key, shift: bool) -> Option<char> {
+    match key {
+        Key::A => Some(if shift { 'A' } else { 'a' }),
+        Key::B => Some(if shift { 'B' } else { 'b' }),
+        Key::C => Some(if shift { 'C' } else { 'c' }),
+        Key::D => Some(if shift { 'D' } else { 'd' }),
+        Key::E => Some(if shift { 'E' } else { 'e' }),
+        Key::F => Some(if shift { 'F' } else { 'f' }),
+        Key::G => Some(if shift { 'G' } else { 'g' }),
+        Key::H => Some(if shift { 'H' } else { 'h' }),
+        Key::I => Some(if shift { 'I' } else { 'i' }),
+        Key::J => Some(if shift { 'J' } else { 'j' }),
+        Key::K => Some(if shift { 'K' } else { 'k' }),
+        Key::L => Some(if shift { 'L' } else { 'l' }),
+        Key::M => Some(if shift { 'M' } else { 'm' }),
+        Key::N => Some(if shift { 'N' } else { 'n' }),
+        Key::O => Some(if shift { 'O' } else { 'o' }),
+        Key::P => Some(if shift { 'P' } else { 'p' }),
+        Key::Q => Some(if shift { 'Q' } else { 'q' }),
+        Key::R => Some(if shift { 'R' } else { 'r' }),
+        Key::S => Some(if shift { 'S' } else { 's' }),
+        Key::T => Some(if shift { 'T' } else { 't' }),
+        Key::U => Some(if shift { 'U' } else { 'u' }),
+        Key::V => Some(if shift { 'V' } else { 'v' }),
+        Key::W => Some(if shift { 'W' } else { 'w' }),
+        Key::X => Some(if shift { 'X' } else { 'x' }),
+        Key::Y => Some(if shift { 'Y' } else { 'y' }),
+        Key::Z => Some(if shift { 'Z' } else { 'z' }),
+        Key::Key0 => Some(if shift { ')' } else { '0' }),
+        Key::Key1 => Some(if shift { '!' } else { '1' }),
+        Key::Key2 => Some(if shift { '@' } else { '2' }),
+        Key::Key3 => Some(if shift { '#' } else { '3' }),
+        Key::Key4 => Some(if shift { '$' } else { '4' }),
+        Key::Key5 => Some(if shift { '%' } else { '5' }),
+        Key::Key6 => Some(if shift { '^' } else { '6' }),
+        Key::Key7 => Some(if shift { '&' } else { '7' }),
+        Key::Key8 => Some(if shift { '*' } else { '8' }),
+        Key::Key9 => Some(if shift { '(' } else { '9' }),
+        Key::Space => Some(' '),
+        Key::Minus => Some(if shift { '_' } else { '-' }),
+        Key::Equal => Some(if shift { '+' } else { '=' }),
+        Key::Period => Some(if shift { '>' } else { '.' }),
+        Key::Comma => Some(if shift { '<' } else { ',' }),
+        Key::Slash => Some(if shift { '?' } else { '/' }),
+        _ => None,
+    }
+}
+
+/// Get the previous tab in order
+fn prev_tab(tab: Tab) -> Tab {
+    match tab {
+        Tab::Specifications => Tab::Menu,
+        Tab::Verification => Tab::Specifications,
+        Tab::DesignSnippets => Tab::Verification,
+        Tab::Help => Tab::DesignSnippets,
+        Tab::Menu => Tab::Help,
+    }
+}
+
+/// Get the next tab in order
+fn next_tab(tab: Tab) -> Tab {
+    match tab {
+        Tab::Specifications => Tab::Verification,
+        Tab::Verification => Tab::DesignSnippets,
+        Tab::DesignSnippets => Tab::Help,
+        Tab::Help => Tab::Menu,
+        Tab::Menu => Tab::Specifications,
+    }
+}
+
 /// Handle keyboard input
 fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, new_keys: &[Key], window: &Window) {
-    // Check if shift is held
+    // Check if modifier keys are held
     let shift_held = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+    let ctrl_held = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
+
+    // Handle dialog input first (captures all keys when dialog is open)
+    if let DialogState::SaveSnippet { ref mut name } = editor.dialog {
+        for key in new_keys {
+            match key {
+                Key::Enter => {
+                    // Save the snippet with the entered name
+                    if let Some(ref mut snippet) = editor.yank_buffer {
+                        snippet.name = if name.is_empty() { "snippet".to_string() } else { name.clone() };
+                        // Save to disk
+                        if let Err(e) = save_snippet_to_file(snippet, &editor.snippets_dir) {
+                            eprintln!("Failed to save snippet: {}", e);
+                        }
+                        editor.snippets.push(snippet.clone());
+                        editor.selected_snippet = editor.snippets.len() - 1;
+                    }
+                    editor.dialog = DialogState::None;
+                    return;
+                }
+                Key::Escape => {
+                    editor.dialog = DialogState::None;
+                    return;
+                }
+                Key::Backspace => {
+                    name.pop();
+                }
+                _ => {
+                    // Try to get character for the key
+                    if let Some(c) = key_to_char(*key, shift_held) {
+                        name.push(c);
+                    }
+                }
+            }
+        }
+        return; // Don't process other input while dialog is open
+    }
 
     for key in new_keys {
+        // Shift + arrow keys for tab switching
+        if shift_held {
+            match key {
+                Key::Left | Key::H => {
+                    editor.active_tab = prev_tab(editor.active_tab);
+                    continue;
+                }
+                Key::Right | Key::L => {
+                    editor.active_tab = next_tab(editor.active_tab);
+                    continue;
+                }
+                // Shift + up/down for within-tab navigation (snippet selection)
+                Key::Up | Key::K => {
+                    if editor.active_tab == Tab::DesignSnippets && !editor.snippets.is_empty() {
+                        editor.selected_snippet = editor.selected_snippet.saturating_sub(1);
+                    }
+                    continue;
+                }
+                Key::Down | Key::J => {
+                    if editor.active_tab == Tab::DesignSnippets && !editor.snippets.is_empty() {
+                        editor.selected_snippet = (editor.selected_snippet + 1).min(editor.snippets.len() - 1);
+                    }
+                    continue;
+                }
+                // Shift + D to delete selected snippet
+                Key::D => {
+                    if editor.active_tab == Tab::DesignSnippets && !editor.snippets.is_empty() {
+                        let idx = editor.selected_snippet;
+                        if idx < editor.snippets.len() {
+                            // Delete the file from disk
+                            let snippet = &editor.snippets[idx];
+                            if let Err(e) = delete_snippet_file(snippet, &editor.snippets_dir) {
+                                eprintln!("Failed to delete snippet file: {}", e);
+                            }
+                            // Remove from list
+                            editor.snippets.remove(idx);
+                            // Adjust selected index
+                            if editor.selected_snippet >= editor.snippets.len() && editor.selected_snippet > 0 {
+                                editor.selected_snippet -= 1;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         match key {
             // Mode switching (1-8)
             Key::Key1 => {
@@ -798,10 +1516,22 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, new_keys: &[Key
                 editor.current_path.clear();
                 editor.selection_anchor = None;
             }
+            Key::Key9 => {
+                editor.mode = EditMode::MouseSelect;
+                editor.path_start = None;
+                editor.current_path.clear();
+                editor.selection_anchor = None;
+                editor.mouse_selection_end = None;
+            }
 
             // Visual mode keys (only active in Visual mode)
             _ if editor.mode == EditMode::Visual => {
-                handle_visual_mode_key(circuit, editor, *key, shift_held);
+                handle_visual_mode_key(circuit, editor, *key, shift_held, ctrl_held);
+            }
+
+            // MouseSelect mode keys
+            _ if editor.mode == EditMode::MouseSelect => {
+                handle_mouse_select_key(circuit, editor, *key);
             }
 
             _ => {}
@@ -809,92 +1539,268 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, new_keys: &[Key
     }
 }
 
+// Playable area boundaries
+const PLAYABLE_LEFT: usize = 4;
+const PLAYABLE_RIGHT: usize = 39;
+const PLAYABLE_WIDTH: usize = PLAYABLE_RIGHT - PLAYABLE_LEFT + 1; // 36
+
 /// Handle visual mode keyboard input
-fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key, shift_held: bool) {
+fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key, shift_held: bool, ctrl_held: bool) {
     let prev_x = editor.cursor_x;
     let prev_y = editor.cursor_y;
+    let modifier = editor.pending_modifier;
 
-    match key {
-        // Movement: hjkl or arrow keys
-        Key::H | Key::Left => {
-            if editor.cursor_x > 0 {
-                editor.cursor_x -= 1;
+    // Handle goto prefix commands (g + something)
+    if modifier == PendingModifier::Goto {
+        match key {
+            Key::G => {
+                // gg - go to top row
+                editor.cursor_y = 0;
+                editor.clear_modifier();
+            }
+            Key::E => {
+                // ge - go to last row
+                editor.cursor_y = GRID_HEIGHT - 1;
+                editor.clear_modifier();
+            }
+            Key::D => {
+                // gd - go down by half
+                editor.cursor_y = (editor.cursor_y + GRID_HEIGHT / 2).min(GRID_HEIGHT - 1);
+                editor.clear_modifier();
+            }
+            Key::U => {
+                // gu - go up by half
+                editor.cursor_y = editor.cursor_y.saturating_sub(GRID_HEIGHT / 2);
+                editor.clear_modifier();
+            }
+            Key::H => {
+                // gh - go right by half width
+                editor.cursor_x = (editor.cursor_x + PLAYABLE_WIDTH / 2).min(GRID_WIDTH - 1);
+                editor.clear_modifier();
+            }
+            Key::B => {
+                // gb - go back (left) by half width
+                editor.cursor_x = editor.cursor_x.saturating_sub(PLAYABLE_WIDTH / 2);
+                editor.clear_modifier();
+            }
+            Key::Escape => {
+                editor.clear_modifier();
+            }
+            _ => {
+                // Invalid g command, clear modifier
+                editor.clear_modifier();
             }
         }
-        Key::J | Key::Down => {
-            if editor.cursor_y < GRID_HEIGHT - 1 {
-                editor.cursor_y += 1;
+    }
+    // Handle silicon/metal modifier commands
+    else if modifier == PendingModifier::Silicon || modifier == PendingModifier::Metal {
+        match key {
+            Key::D => {
+                // sd or md - delete with filter
+                if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                    for y in y1..=y2 {
+                        for x in x1..=x2 {
+                            if is_playable(x, y) {
+                                match modifier {
+                                    PendingModifier::Silicon => delete_silicon(circuit, x, y),
+                                    PendingModifier::Metal => delete_metal(circuit, x, y),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    editor.visual_state = VisualState::Normal;
+                    editor.selection_anchor = None;
+                } else if is_playable(editor.cursor_x, editor.cursor_y) {
+                    match modifier {
+                        PendingModifier::Silicon => delete_silicon(circuit, editor.cursor_x, editor.cursor_y),
+                        PendingModifier::Metal => delete_metal(circuit, editor.cursor_x, editor.cursor_y),
+                        _ => {}
+                    }
+                }
+                editor.clear_modifier();
+            }
+            Key::E => {
+                // se or me - move right until silicon/metal found
+                let target_x = find_material_right(circuit, editor.cursor_x, editor.cursor_y, modifier);
+                editor.cursor_x = target_x;
+                editor.clear_modifier();
+            }
+            Key::Escape => {
+                editor.clear_modifier();
+            }
+            _ => {
+                editor.clear_modifier();
             }
         }
-        Key::K | Key::Up => {
-            if editor.cursor_y > 0 {
-                editor.cursor_y -= 1;
+    }
+    // Normal commands (no modifier)
+    else {
+        match key {
+            // Prefix modifiers
+            Key::S => {
+                editor.pending_modifier = PendingModifier::Silicon;
+                return; // Don't clear modifier or do material placement
             }
-        }
-        Key::L | Key::Right => {
-            if editor.cursor_x < GRID_WIDTH - 1 {
-                editor.cursor_x += 1;
+            Key::M => {
+                editor.pending_modifier = PendingModifier::Metal;
+                return;
             }
-        }
+            Key::G => {
+                editor.pending_modifier = PendingModifier::Goto;
+                return;
+            }
 
-        // 'v' - toggle visual selection mode
-        Key::V => {
-            if editor.visual_state == VisualState::Selecting {
-                editor.visual_state = VisualState::Normal;
-                editor.selection_anchor = None;
-            } else {
-                editor.visual_state = VisualState::Selecting;
-                editor.selection_anchor = Some((editor.cursor_x, editor.cursor_y));
+            // Movement: hjkl or arrow keys
+            Key::H | Key::Left => {
+                if ctrl_held {
+                    // Ctrl+H not used, but keep for consistency
+                }
+                if editor.cursor_x > 0 {
+                    editor.cursor_x -= 1;
+                }
             }
-        }
-
-        // 'd' - delete selection or cursor position
-        Key::D => {
-            if let Some((x1, y1, x2, y2)) = editor.get_selection() {
-                delete_region(circuit, x1, y1, x2, y2);
-                editor.visual_state = VisualState::Normal;
-                editor.selection_anchor = None;
-            } else if is_playable(editor.cursor_x, editor.cursor_y) {
-                delete_all(circuit, editor.cursor_x, editor.cursor_y);
+            Key::J | Key::Down => {
+                if editor.cursor_y < GRID_HEIGHT - 1 {
+                    editor.cursor_y += 1;
+                }
             }
-        }
-
-        // '=' for metal, '+' (Shift + =) for P-silicon
-        Key::Equal => {
-            if shift_held {
-                // '+' - P-silicon placing mode
-                editor.visual_state = VisualState::PlacingP;
-            } else {
-                // '=' - metal placing mode
-                editor.visual_state = VisualState::PlacingMetal;
+            Key::K | Key::Up => {
+                if editor.cursor_y > 0 {
+                    editor.cursor_y -= 1;
+                }
             }
-        }
+            Key::L | Key::Right => {
+                if editor.cursor_x < GRID_WIDTH - 1 {
+                    editor.cursor_x += 1;
+                }
+            }
 
-        // '-' - enter N-silicon placing mode
-        Key::Minus => {
-            editor.visual_state = VisualState::PlacingN;
-        }
+            // 'w' - move right by 4
+            Key::W => {
+                editor.cursor_x = (editor.cursor_x + 4).min(GRID_WIDTH - 1);
+            }
 
-        // '.' - toggle via at cursor
-        Key::Period => {
-            if is_playable(editor.cursor_x, editor.cursor_y) {
-                if let Some(node) = circuit.get_node(editor.cursor_x, editor.cursor_y) {
-                    if node.via {
-                        delete_via(circuit, editor.cursor_x, editor.cursor_y);
-                    } else {
-                        place_via(circuit, editor.cursor_x, editor.cursor_y);
+            // 'b' - move left by 4 (back)
+            Key::B => {
+                editor.cursor_x = editor.cursor_x.saturating_sub(4);
+            }
+
+            // 'e' - move right until any material found
+            Key::E => {
+                let target_x = find_material_right(circuit, editor.cursor_x, editor.cursor_y, PendingModifier::None);
+                editor.cursor_x = target_x;
+            }
+
+            // Ctrl+A - move to left edge of playable area
+            Key::A if ctrl_held => {
+                editor.cursor_x = PLAYABLE_LEFT;
+            }
+
+            // Ctrl+E - move to right edge of playable area
+            // Note: Key::E with ctrl is handled above in the 'e' match, so we check ctrl there
+
+            // 'v' - toggle visual selection mode
+            Key::V => {
+                if editor.visual_state == VisualState::Selecting {
+                    editor.visual_state = VisualState::Normal;
+                    editor.selection_anchor = None;
+                } else {
+                    editor.visual_state = VisualState::Selecting;
+                    editor.selection_anchor = Some((editor.cursor_x, editor.cursor_y));
+                }
+            }
+
+            // 'd' - delete selection or cursor position (all)
+            Key::D => {
+                if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                    delete_region(circuit, x1, y1, x2, y2);
+                    editor.visual_state = VisualState::Normal;
+                    editor.selection_anchor = None;
+                } else if is_playable(editor.cursor_x, editor.cursor_y) {
+                    delete_all(circuit, editor.cursor_x, editor.cursor_y);
+                }
+            }
+
+            // '=' for metal, '+' (Shift + =) for P-silicon
+            Key::Equal => {
+                if shift_held {
+                    // '+' - P-silicon placing mode
+                    editor.visual_state = VisualState::PlacingP;
+                } else {
+                    // '=' - metal placing mode
+                    editor.visual_state = VisualState::PlacingMetal;
+                }
+            }
+
+            // '-' - enter N-silicon placing mode
+            Key::Minus => {
+                editor.visual_state = VisualState::PlacingN;
+            }
+
+            // '.' - toggle via at cursor
+            Key::Period => {
+                if is_playable(editor.cursor_x, editor.cursor_y) {
+                    if let Some(node) = circuit.get_node(editor.cursor_x, editor.cursor_y) {
+                        if node.via {
+                            delete_via(circuit, editor.cursor_x, editor.cursor_y);
+                        } else {
+                            place_via(circuit, editor.cursor_x, editor.cursor_y);
+                        }
                     }
                 }
             }
-        }
 
-        // Escape - exit any sub-mode, return to normal visual mode
-        Key::Escape => {
-            editor.visual_state = VisualState::Normal;
-            editor.selection_anchor = None;
-        }
+            // 'y' - yank (copy) selection to snippet (opens dialog if has selection)
+            Key::Y => {
+                if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                    // Yank to buffer first
+                    editor.yank_buffer = Some(yank_region(circuit, x1, y1, x2, y2, String::new()));
+                    // Open dialog to name the snippet
+                    editor.dialog = DialogState::SaveSnippet { name: String::new() };
+                    editor.visual_state = VisualState::Normal;
+                    editor.selection_anchor = None;
+                }
+            }
 
-        _ => {}
+            // 'p' - paste from yank buffer or selected snippet
+            Key::P => {
+                // First try yank buffer, then selected snippet
+                let snippet_to_paste = editor.yank_buffer.clone()
+                    .or_else(|| editor.snippets.get(editor.selected_snippet).cloned());
+
+                if let Some(snippet) = snippet_to_paste {
+                    paste_snippet(circuit, &snippet, editor.cursor_x, editor.cursor_y);
+                }
+            }
+
+            // 'r' - rotate the current snippet (yank buffer or selected)
+            Key::R => {
+                // Rotate yank buffer if present
+                if let Some(ref snippet) = editor.yank_buffer {
+                    editor.yank_buffer = Some(rotate_snippet(snippet));
+                } else if !editor.snippets.is_empty() {
+                    // Rotate the selected snippet in place
+                    let idx = editor.selected_snippet;
+                    if idx < editor.snippets.len() {
+                        editor.snippets[idx] = rotate_snippet(&editor.snippets[idx]);
+                    }
+                }
+            }
+
+            // Escape - exit any sub-mode, return to normal visual mode
+            Key::Escape => {
+                editor.visual_state = VisualState::Normal;
+                editor.selection_anchor = None;
+            }
+
+            _ => {}
+        }
+    }
+
+    // Handle Ctrl+E separately (since E is also used for other things)
+    if ctrl_held && key == Key::E {
+        editor.cursor_x = PLAYABLE_RIGHT;
     }
 
     // If in placing mode and cursor moved, place material
@@ -912,6 +1818,158 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
             _ => {}
         }
     }
+}
+
+/// Handle keys in MouseSelect mode (y, p, r, d, s, m, Escape)
+fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key) {
+    // Check if selection is finalized (both clicks done)
+    let selection_finalized = editor.selection_anchor.is_some() && editor.mouse_selection_end.is_some();
+
+    // Handle pending modifier first
+    match editor.pending_modifier {
+        PendingModifier::Silicon => {
+            match key {
+                Key::D => {
+                    // Delete only silicon in selection
+                    if selection_finalized {
+                        if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                            for y in y1..=y2 {
+                                for x in x1..=x2 {
+                                    delete_silicon(circuit, x, y);
+                                }
+                            }
+                            editor.selection_anchor = None;
+                            editor.mouse_selection_end = None;
+                        }
+                    }
+                    editor.clear_modifier();
+                    return;
+                }
+                Key::Escape => {
+                    editor.clear_modifier();
+                    return;
+                }
+                _ => {
+                    editor.clear_modifier();
+                }
+            }
+        }
+        PendingModifier::Metal => {
+            match key {
+                Key::D => {
+                    // Delete only metal in selection
+                    if selection_finalized {
+                        if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                            for y in y1..=y2 {
+                                for x in x1..=x2 {
+                                    delete_metal(circuit, x, y);
+                                }
+                            }
+                            editor.selection_anchor = None;
+                            editor.mouse_selection_end = None;
+                        }
+                    }
+                    editor.clear_modifier();
+                    return;
+                }
+                Key::Escape => {
+                    editor.clear_modifier();
+                    return;
+                }
+                _ => {
+                    editor.clear_modifier();
+                }
+            }
+        }
+        _ => {}
+    }
+
+    match key {
+        // 's' - silicon modifier prefix
+        Key::S => {
+            editor.pending_modifier = PendingModifier::Silicon;
+        }
+
+        // 'm' - metal modifier prefix
+        Key::M => {
+            editor.pending_modifier = PendingModifier::Metal;
+        }
+
+        // 'y' - yank selection (only when finalized)
+        Key::Y => {
+            if selection_finalized {
+                if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                    editor.yank_buffer = Some(yank_region(circuit, x1, y1, x2, y2, String::new()));
+                    editor.dialog = DialogState::SaveSnippet { name: String::new() };
+                }
+            }
+        }
+
+        // 'p' - paste (works anytime)
+        Key::P => {
+            let snippet_to_paste = editor.yank_buffer.clone()
+                .or_else(|| editor.snippets.get(editor.selected_snippet).cloned());
+
+            if let Some(snippet) = snippet_to_paste {
+                paste_snippet(circuit, &snippet, editor.cursor_x, editor.cursor_y);
+            }
+        }
+
+        // 'r' - rotate snippet
+        Key::R => {
+            if let Some(ref snippet) = editor.yank_buffer {
+                editor.yank_buffer = Some(rotate_snippet(snippet));
+            } else if !editor.snippets.is_empty() {
+                let idx = editor.selected_snippet;
+                if idx < editor.snippets.len() {
+                    editor.snippets[idx] = rotate_snippet(&editor.snippets[idx]);
+                }
+            }
+        }
+
+        // 'd' - delete selection (only when finalized)
+        Key::D => {
+            if selection_finalized {
+                if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                    for y in y1..=y2 {
+                        for x in x1..=x2 {
+                            delete_all(circuit, x, y);
+                        }
+                    }
+                    editor.selection_anchor = None;
+                    editor.mouse_selection_end = None;
+                }
+            }
+        }
+
+        // Escape - clear selection
+        Key::Escape => {
+            editor.selection_anchor = None;
+            editor.mouse_selection_end = None;
+        }
+
+        _ => {}
+    }
+}
+
+/// Find the next cell to the right that contains material
+/// modifier: None = any material, Silicon = silicon only, Metal = metal only
+fn find_material_right(circuit: &Circuit, start_x: usize, y: usize, modifier: PendingModifier) -> usize {
+    for x in (start_x + 1)..GRID_WIDTH {
+        if let Some(node) = circuit.get_node(x, y) {
+            let has_target = match modifier {
+                PendingModifier::None => node.silicon != Silicon::None || node.metal,
+                PendingModifier::Silicon => node.silicon != Silicon::None,
+                PendingModifier::Metal => node.metal,
+                PendingModifier::Goto => false, // shouldn't happen
+            };
+            if has_target {
+                return x;
+            }
+        }
+    }
+    // If nothing found, go to end
+    GRID_WIDTH - 1
 }
 
 /// Handle mouse input
@@ -995,10 +2053,37 @@ fn handle_mouse(
         }
 
         EditMode::Visual => {
-            // In visual mode, mouse clicks can move cursor
+            // In visual mode, mouse clicks move cursor
             if left_clicked {
                 editor.cursor_x = grid_x;
                 editor.cursor_y = grid_y;
+            }
+        }
+
+        EditMode::MouseSelect => {
+            // Two-click selection mode
+            if left_clicked {
+                if editor.selection_anchor.is_none() {
+                    // First click: set anchor
+                    editor.selection_anchor = Some((grid_x, grid_y));
+                    editor.mouse_selection_end = None;
+                } else if editor.mouse_selection_end.is_none() {
+                    // Second click: finalize selection
+                    editor.mouse_selection_end = Some((grid_x, grid_y));
+                } else {
+                    // Already have finalized selection, start new one
+                    editor.selection_anchor = Some((grid_x, grid_y));
+                    editor.mouse_selection_end = None;
+                }
+            }
+            // Right click pastes (same as 'p')
+            if right_clicked {
+                let snippet_to_paste = editor.yank_buffer.clone()
+                    .or_else(|| editor.snippets.get(editor.selected_snippet).cloned());
+
+                if let Some(snippet) = snippet_to_paste {
+                    paste_snippet(circuit, &snippet, editor.cursor_x, editor.cursor_y);
+                }
             }
         }
     }
@@ -1284,12 +2369,23 @@ fn render(circuit: &Circuit, editor: &EditorState, pins: &[Pin], font: &HashMap<
         }
     }
 
-    // Draw cursor (for visual mode)
-    if editor.mode == EditMode::Visual {
+    // Draw ghost preview of snippet when Snippets tab is active and in visual/mouse-select mode
+    if (editor.mode == EditMode::Visual || editor.mode == EditMode::MouseSelect) && editor.active_tab == Tab::DesignSnippets {
+        // Try yank buffer first, then selected snippet
+        let snippet_to_preview = editor.yank_buffer.as_ref()
+            .or_else(|| editor.snippets.get(editor.selected_snippet));
+
+        if let Some(snippet) = snippet_to_preview {
+            render_snippet_ghost(snippet, editor.cursor_x, editor.cursor_y, buffer);
+        }
+    }
+
+    // Draw cursor (for visual and mouse-select modes)
+    if editor.mode == EditMode::Visual || editor.mode == EditMode::MouseSelect {
         draw_cursor(editor.cursor_x, editor.cursor_y, buffer);
     }
 
-    // Draw mode indicator at top-left
+    // Draw mode indicator at top-left (shows current mode, submode, and pending modifier)
     let mode_text = match editor.mode {
         EditMode::NSilicon => "1:N-Si",
         EditMode::PSilicon => "2:P-Si",
@@ -1298,15 +2394,629 @@ fn render(circuit: &Circuit, editor: &EditorState, pins: &[Pin], font: &HashMap<
         EditMode::DeleteMetal => "5:DelM",
         EditMode::DeleteSilicon => "6:DelS",
         EditMode::DeleteAll => "7:DelA",
-        EditMode::Visual => match editor.visual_state {
-            VisualState::Normal => "8:Vis",
-            VisualState::Selecting => "8:V-Sel",
-            VisualState::PlacingN => "8:V-N",
-            VisualState::PlacingP => "8:V-P",
-            VisualState::PlacingMetal => "8:V-M",
+        EditMode::Visual => match editor.pending_modifier {
+            PendingModifier::Silicon => "8:s-",
+            PendingModifier::Metal => "8:m-",
+            PendingModifier::Goto => "8:g-",
+            PendingModifier::None => match editor.visual_state {
+                VisualState::Normal => "8:Vis",
+                VisualState::Selecting => "8:V-Sel",
+                VisualState::PlacingN => "8:V-N",
+                VisualState::PlacingP => "8:V-P",
+                VisualState::PlacingMetal => "8:V-M",
+            },
         },
+        EditMode::MouseSelect => match editor.pending_modifier {
+            PendingModifier::Silicon => "9:s-",
+            PendingModifier::Metal => "9:m-",
+            PendingModifier::Goto => "9:g-",
+            PendingModifier::None => {
+                if editor.mouse_selection_end.is_some() {
+                    "9:Ready"  // Selection finalized, ready for y/d/p
+                } else if editor.selection_anchor.is_some() {
+                    "9:Sel.."  // Waiting for second click
+                } else {
+                    "9:MSel"   // No selection yet
+                }
+            }
+        }
     };
     draw_text(mode_text, 40, 10, font, 0xffffff, buffer);
+
+    // Draw the UI panel on the right
+    render_panel(editor, font, buffer);
+
+    // Draw the bottom area (help text and tabs)
+    render_bottom_area(editor, font, buffer);
+
+    // Draw dialog overlay if open
+    if let DialogState::SaveSnippet { ref name } = editor.dialog {
+        render_dialog("SAVE DESIGN SNIPPET", "Enter name for snippet:", name, font, buffer);
+    }
+}
+
+/// Render a modal dialog
+fn render_dialog(title: &str, prompt: &str, input: &str, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
+    let dialog_w = 300;
+    let dialog_h = 120;
+    let dialog_x = (WINDOW_WIDTH - dialog_w) / 2;
+    let dialog_y = (GRID_PIXEL_HEIGHT - dialog_h) / 2;
+
+    // Darken background
+    for y in 0..WINDOW_HEIGHT {
+        for x in 0..WINDOW_WIDTH {
+            buffer[y * WINDOW_WIDTH + x] = alpha_blend(0x000000, buffer[y * WINDOW_WIDTH + x], 0.3);
+        }
+    }
+
+    // Draw dialog background
+    for y in dialog_y..dialog_y + dialog_h {
+        for x in dialog_x..dialog_x + dialog_w {
+            if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                buffer[y * WINDOW_WIDTH + x] = COLOR_BUTTON_BG;
+            }
+        }
+    }
+
+    // Draw dialog border
+    for x in dialog_x..dialog_x + dialog_w {
+        if dialog_y < WINDOW_HEIGHT {
+            buffer[dialog_y * WINDOW_WIDTH + x] = COLOR_BUTTON_LIGHT;
+        }
+        if dialog_y + dialog_h - 1 < WINDOW_HEIGHT {
+            buffer[(dialog_y + dialog_h - 1) * WINDOW_WIDTH + x] = COLOR_BUTTON_DARK;
+        }
+    }
+    for y in dialog_y..dialog_y + dialog_h {
+        if y < WINDOW_HEIGHT {
+            buffer[y * WINDOW_WIDTH + dialog_x] = COLOR_BUTTON_LIGHT;
+            if dialog_x + dialog_w - 1 < WINDOW_WIDTH {
+                buffer[y * WINDOW_WIDTH + dialog_x + dialog_w - 1] = COLOR_BUTTON_DARK;
+            }
+        }
+    }
+
+    // Draw title bar
+    for y in dialog_y..dialog_y + 24 {
+        for x in dialog_x..dialog_x + dialog_w {
+            if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                buffer[y * WINDOW_WIDTH + x] = COLOR_PANEL_BG;
+            }
+        }
+    }
+    draw_text(title, dialog_x + dialog_w / 2, dialog_y + 12, font, COLOR_HELP_TEXT, buffer);
+
+    // Draw prompt
+    draw_text(prompt, dialog_x + dialog_w / 2, dialog_y + 45, font, COLOR_BUTTON_TEXT, buffer);
+
+    // Draw input field background
+    let input_x = dialog_x + 20;
+    let input_y = dialog_y + 60;
+    let input_w = dialog_w - 40;
+    let input_h = 24;
+    for y in input_y..input_y + input_h {
+        for x in input_x..input_x + input_w {
+            if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                buffer[y * WINDOW_WIDTH + x] = 0xffffff; // White input background
+            }
+        }
+    }
+
+    // Draw input text (left-aligned)
+    let display_text = if input.is_empty() { "snippet" } else { input };
+    draw_text_left(display_text, input_x + 5, input_y + input_h / 2, font, if input.is_empty() { 0x808080 } else { COLOR_BUTTON_TEXT }, buffer);
+
+    // Draw cursor - calculate actual text width from font
+    let mut text_width = 0;
+    for ch in input.chars() {
+        if let Some(glyph) = font.get(&ch) {
+            text_width += glyph.get(0).map(|r| r.len()).unwrap_or(0) + 1;
+        }
+    }
+    let cursor_x = input_x + 5 + text_width;
+    if cursor_x < input_x + input_w - 5 {
+        for y in input_y + 4..input_y + input_h - 4 {
+            if y < WINDOW_HEIGHT && cursor_x < WINDOW_WIDTH {
+                buffer[y * WINDOW_WIDTH + cursor_x] = COLOR_BUTTON_TEXT;
+            }
+        }
+    }
+
+    // Draw hint
+    draw_text("Enter: save | Esc: cancel", dialog_x + dialog_w / 2, dialog_y + dialog_h - 15, font, 0x606060, buffer);
+}
+
+/// Get context-sensitive help text based on current mode/state
+fn get_help_text(editor: &EditorState) -> &'static str {
+    match editor.mode {
+        EditMode::Visual => match editor.pending_modifier {
+            PendingModifier::Silicon => "d:del silicon | e:find silicon | Esc:cancel",
+            PendingModifier::Metal => "d:del metal | e:find metal | Esc:cancel",
+            PendingModifier::Goto => "g:top | e:bottom | d:half-down | u:half-up | h:half-right | b:half-left",
+            PendingModifier::None => match editor.visual_state {
+                VisualState::Normal => "hjkl:move w/b:fast e:find | v:select | -+=.d y p r",
+                VisualState::Selecting => "hjkl:extend | y:yank | d/sd/md:delete | Esc:cancel",
+                VisualState::PlacingN => "hjkl:draw N-silicon | Esc:stop",
+                VisualState::PlacingP => "hjkl:draw P-silicon | Esc:stop",
+                VisualState::PlacingMetal => "hjkl:draw metal | Esc:stop",
+            },
+        },
+        EditMode::MouseSelect => match editor.pending_modifier {
+            PendingModifier::Silicon => "d:del silicon | Esc:cancel",
+            PendingModifier::Metal => "d:del metal | Esc:cancel",
+            _ => {
+                if editor.mouse_selection_end.is_some() {
+                    "y:yank | d/sd/md:delete | p/RClick:paste | r:rotate | Click:new | Esc:clear"
+                } else if editor.selection_anchor.is_some() {
+                    "Click to set 2nd corner | Esc:cancel"
+                } else {
+                    "Click to set 1st corner | p/RClick:paste | r:rotate"
+                }
+            }
+        }
+        EditMode::NSilicon => "Click start, click end to place N-silicon | Esc/RClick:cancel",
+        EditMode::PSilicon => "Click start, click end to place P-silicon | Esc/RClick:cancel",
+        EditMode::Metal => "Click start, click end to place metal | Esc/RClick:cancel",
+        EditMode::Via => "LClick:place via | RClick:delete via",
+        EditMode::DeleteMetal => "Click/drag to delete metal",
+        EditMode::DeleteSilicon => "Click/drag to delete silicon",
+        EditMode::DeleteAll => "Click/drag to delete everything",
+    }
+}
+
+/// Render the bottom area with help text, tabs, and content
+fn render_bottom_area(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
+    let help_y = GRID_PIXEL_HEIGHT;
+    let tab_y = help_y + HELP_AREA_HEIGHT;
+    let content_y = tab_y + TAB_HEIGHT;
+
+    // Draw help area background
+    for y in help_y..help_y + HELP_AREA_HEIGHT {
+        for x in 0..WINDOW_WIDTH {
+            buffer[y * WINDOW_WIDTH + x] = COLOR_HELP_BG;
+        }
+    }
+
+    // Draw help text
+    let help_text = get_help_text(editor);
+    draw_text(help_text, WINDOW_WIDTH / 2, help_y + HELP_AREA_HEIGHT / 2, font, COLOR_HELP_TEXT, buffer);
+
+    // Draw tabs
+    let tabs = [
+        (Tab::Specifications, "Specs"),
+        (Tab::Verification, "Verify"),
+        (Tab::DesignSnippets, "Snippets"),
+        (Tab::Help, "Help"),
+        (Tab::Menu, "Menu"),
+    ];
+
+    let tab_width = WINDOW_WIDTH / tabs.len();
+    for (i, (tab, label)) in tabs.iter().enumerate() {
+        let tx = i * tab_width;
+        let is_active = editor.active_tab == *tab;
+        let bg_color = if is_active { COLOR_TAB_ACTIVE_BG } else { COLOR_TAB_BG };
+
+        // Draw tab background (just the tab bar, not content)
+        for y in tab_y..content_y {
+            for x in tx..tx + tab_width {
+                if x < WINDOW_WIDTH {
+                    let color = if x == tx { COLOR_BUTTON_LIGHT } else if x == tx + tab_width - 1 { COLOR_BUTTON_DARK } else { bg_color };
+                    buffer[y * WINDOW_WIDTH + x] = color;
+                }
+            }
+        }
+
+        // Draw tab text
+        let text_x = tx + tab_width / 2;
+        let text_y = tab_y + TAB_HEIGHT / 2;
+        draw_text(label, text_x, text_y, font, COLOR_TAB_TEXT, buffer);
+    }
+
+    // Draw content area background
+    for y in content_y..WINDOW_HEIGHT {
+        for x in 0..WINDOW_WIDTH {
+            buffer[y * WINDOW_WIDTH + x] = 0xd0d0d0; // Light gray content background
+        }
+    }
+
+    // Draw tab content
+    match editor.active_tab {
+        Tab::DesignSnippets => {
+            render_snippets_tab(editor, content_y, font, buffer);
+        }
+        Tab::Help => {
+            let help_lines = [
+                "Shift+arrows: switch tabs | Shift+j/k: scroll snippets",
+                "Shift+D: delete snippet | y: yank | p: paste | r: rotate",
+                "v: start selection | d: delete | sd/md: delete silicon/metal",
+            ];
+            for (i, line) in help_lines.iter().enumerate() {
+                draw_text(line, 10, content_y + 15 + i * 16, font, COLOR_BUTTON_TEXT, buffer);
+            }
+        }
+        _ => {
+            // Placeholder for other tabs
+            draw_text("(Coming soon)", WINDOW_WIDTH / 2, content_y + TAB_CONTENT_HEIGHT / 2, font, COLOR_BUTTON_TEXT, buffer);
+        }
+    }
+}
+
+/// Render the snippets tab content
+fn render_snippets_tab(editor: &EditorState, content_y: usize, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
+    let list_width = WINDOW_WIDTH / 2;
+    let preview_x = list_width;
+
+    // Draw divider between list and preview
+    for y in content_y..WINDOW_HEIGHT {
+        if list_width < WINDOW_WIDTH {
+            buffer[y * WINDOW_WIDTH + list_width] = COLOR_BUTTON_DARK;
+        }
+    }
+
+    // Draw snippet list
+    if editor.snippets.is_empty() {
+        draw_text("No snippets saved", 10, content_y + 20, font, 0x808080, buffer);
+        draw_text("Select area with 'v', then 'y' to save", 10, content_y + 40, font, 0x808080, buffer);
+    } else {
+        for (i, snippet) in editor.snippets.iter().enumerate() {
+            let item_y = content_y + 8 + i * 18;
+            if item_y + 16 > WINDOW_HEIGHT {
+                break;
+            }
+
+            // Highlight selected snippet
+            if i == editor.selected_snippet {
+                for y in item_y - 2..item_y + 14 {
+                    for x in 2..list_width - 2 {
+                        if y < WINDOW_HEIGHT {
+                            buffer[y * WINDOW_WIDTH + x] = 0xa0c0ff; // Light blue highlight
+                        }
+                    }
+                }
+            }
+
+            draw_text(&snippet.name, 10, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+        }
+    }
+
+    // Draw preview of selected snippet
+    if let Some(snippet) = editor.snippets.get(editor.selected_snippet) {
+        let preview_cell_size = 6; // Small cells for preview
+        let preview_start_x = preview_x + 10;
+        let preview_start_y = content_y + 10;
+
+        // Draw preview grid background
+        let preview_w = snippet.width * preview_cell_size;
+        let preview_h = snippet.height * preview_cell_size;
+        for y in preview_start_y..preview_start_y + preview_h {
+            for x in preview_start_x..preview_start_x + preview_w {
+                if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                    buffer[y * WINDOW_WIDTH + x] = COLOR_BACKGROUND;
+                }
+            }
+        }
+
+        // Draw snippet cells
+        for (sy, row) in snippet.nodes.iter().enumerate() {
+            for (sx, node) in row.iter().enumerate() {
+                let px = preview_start_x + sx * preview_cell_size;
+                let py = preview_start_y + sy * preview_cell_size;
+
+                // Draw silicon
+                let silicon_color = match node.silicon {
+                    Silicon::N => Some(COLOR_N_TYPE),
+                    Silicon::P => Some(COLOR_P_TYPE),
+                    Silicon::Gate { channel } => Some(match channel {
+                        SiliconKind::N => COLOR_N_TYPE,
+                        SiliconKind::P => COLOR_P_TYPE,
+                    }),
+                    Silicon::None => None,
+                };
+
+                if let Some(color) = silicon_color {
+                    for dy in 1..preview_cell_size - 1 {
+                        for dx in 1..preview_cell_size - 1 {
+                            let x = px + dx;
+                            let y = py + dy;
+                            if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                                buffer[y * WINDOW_WIDTH + x] = color;
+                            }
+                        }
+                    }
+                }
+
+                // Draw metal (semi-transparent overlay)
+                if node.metal {
+                    for dy in 1..preview_cell_size - 1 {
+                        for dx in 1..preview_cell_size - 1 {
+                            let x = px + dx;
+                            let y = py + dy;
+                            if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                                buffer[y * WINDOW_WIDTH + x] = alpha_blend(COLOR_METAL, buffer[y * WINDOW_WIDTH + x], 0.5);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Check which tab was clicked (if any)
+fn get_clicked_tab(mx: usize, my: usize) -> Option<Tab> {
+    let tab_y = GRID_PIXEL_HEIGHT + HELP_AREA_HEIGHT;
+
+    // Check if y is in tab area
+    if my < tab_y || my >= WINDOW_HEIGHT {
+        return None;
+    }
+
+    let tabs = [
+        Tab::Specifications,
+        Tab::Verification,
+        Tab::DesignSnippets,
+        Tab::Help,
+        Tab::Menu,
+    ];
+
+    let tab_width = WINDOW_WIDTH / tabs.len();
+    let tab_index = mx / tab_width;
+    if tab_index < tabs.len() {
+        Some(tabs[tab_index])
+    } else {
+        None
+    }
+}
+
+/// Check which panel button was clicked (if any)
+fn get_clicked_button(mx: usize, my: usize) -> Option<EditMode> {
+    let panel_x = GRID_PIXEL_WIDTH;
+    let btn_x = panel_x + BUTTON_MARGIN;
+    let btn_w = PANEL_WIDTH - BUTTON_MARGIN * 2;
+
+    // Check if x is within button bounds
+    if mx < btn_x || mx >= btn_x + btn_w {
+        return None;
+    }
+
+    let modes = [
+        EditMode::NSilicon,
+        EditMode::PSilicon,
+        EditMode::Metal,
+        EditMode::Via,
+        EditMode::DeleteMetal,
+        EditMode::DeleteSilicon,
+        EditMode::DeleteAll,
+        EditMode::Visual,
+        EditMode::MouseSelect,
+    ];
+
+    for (i, mode) in modes.iter().enumerate() {
+        let btn_y = BUTTON_MARGIN + i * (BUTTON_HEIGHT + BUTTON_MARGIN);
+        if my >= btn_y && my < btn_y + BUTTON_HEIGHT {
+            return Some(*mode);
+        }
+    }
+
+    None
+}
+
+/// Render the UI panel with mode buttons
+fn render_panel(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
+    let panel_x = GRID_PIXEL_WIDTH;
+
+    // Fill panel background
+    for y in 0..WINDOW_HEIGHT {
+        for x in panel_x..WINDOW_WIDTH {
+            buffer[y * WINDOW_WIDTH + x] = COLOR_PANEL_BG;
+        }
+    }
+
+    // Button definitions: (mode, label, number, icon_type)
+    let buttons: [(EditMode, &str, &str, ButtonIcon); 9] = [
+        (EditMode::NSilicon, "N-SI", "1", ButtonIcon::NSilicon),
+        (EditMode::PSilicon, "P-SI", "2", ButtonIcon::PSilicon),
+        (EditMode::Metal, "METAL", "3", ButtonIcon::Metal),
+        (EditMode::Via, "VIA", "4", ButtonIcon::Via),
+        (EditMode::DeleteMetal, "DEL M", "5", ButtonIcon::DeleteX),
+        (EditMode::DeleteSilicon, "DEL S", "6", ButtonIcon::DeleteX),
+        (EditMode::DeleteAll, "DEL", "7", ButtonIcon::DeleteX),
+        (EditMode::Visual, "VISUAL", "8", ButtonIcon::Select),
+        (EditMode::MouseSelect, "SELECT", "9", ButtonIcon::Select),
+    ];
+
+    for (i, (mode, label, number, icon)) in buttons.iter().enumerate() {
+        let btn_y = BUTTON_MARGIN + i * (BUTTON_HEIGHT + BUTTON_MARGIN);
+        let btn_x = panel_x + BUTTON_MARGIN;
+        let btn_w = PANEL_WIDTH - BUTTON_MARGIN * 2;
+        let btn_h = BUTTON_HEIGHT;
+
+        let is_active = editor.mode == *mode;
+        draw_button(btn_x, btn_y, btn_w, btn_h, label, number, *icon, is_active, font, buffer);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ButtonIcon {
+    NSilicon,
+    PSilicon,
+    Metal,
+    Via,
+    DeleteX,
+    Select,
+}
+
+/// Draw a panel button with icon, label, and number
+fn draw_button(
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    label: &str,
+    number: &str,
+    icon: ButtonIcon,
+    active: bool,
+    font: &HashMap<char, Vec<Vec<bool>>>,
+    buffer: &mut [u32],
+) {
+    // Draw button background with beveled edges
+    for py in y..y + h {
+        for px in x..x + w {
+            if px < WINDOW_WIDTH && py < WINDOW_HEIGHT {
+                let color = if py == y || px == x {
+                    COLOR_BUTTON_LIGHT
+                } else if py == y + h - 1 || px == x + w - 1 {
+                    COLOR_BUTTON_DARK
+                } else {
+                    COLOR_BUTTON_BG
+                };
+                buffer[py * WINDOW_WIDTH + px] = color;
+            }
+        }
+    }
+
+    // Draw active border (red outline) if this is the current mode
+    if active {
+        let border = 2;
+        for py in y..y + h {
+            for px in x..x + w {
+                if px < WINDOW_WIDTH && py < WINDOW_HEIGHT {
+                    let on_border = px < x + border || px >= x + w - border
+                        || py < y + border || py >= y + h - border;
+                    if on_border {
+                        buffer[py * WINDOW_WIDTH + px] = COLOR_BUTTON_ACTIVE;
+                    }
+                }
+            }
+        }
+    }
+
+    // Draw icon (left side of button)
+    let icon_x = x + 4;
+    let icon_y = y + 4;
+    let icon_size = 20;
+    draw_button_icon(icon_x, icon_y, icon_size, icon, buffer);
+
+    // Draw label text (center-right area)
+    let text_x = x + 28;
+    let text_y = y + 10;
+    draw_text(label, text_x + 20, text_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+
+    // Draw number (bottom right corner)
+    let num_x = x + w - 12;
+    let num_y = y + h - 14;
+    draw_text(number, num_x, num_y, font, COLOR_BUTTON_TEXT, buffer);
+}
+
+/// Draw a small icon representing the button's function
+fn draw_button_icon(x: usize, y: usize, size: usize, icon: ButtonIcon, buffer: &mut [u32]) {
+    match icon {
+        ButtonIcon::NSilicon => {
+            // Red/brown filled square
+            for py in y + 2..y + size - 2 {
+                for px in x + 2..x + size - 2 {
+                    if px < WINDOW_WIDTH && py < WINDOW_HEIGHT {
+                        buffer[py * WINDOW_WIDTH + px] = COLOR_N_TYPE;
+                    }
+                }
+            }
+            // Black outline
+            for px in x + 2..x + size - 2 {
+                if y + 2 < WINDOW_HEIGHT { buffer[(y + 2) * WINDOW_WIDTH + px] = COLOR_OUTLINE; }
+                if y + size - 3 < WINDOW_HEIGHT { buffer[(y + size - 3) * WINDOW_WIDTH + px] = COLOR_OUTLINE; }
+            }
+            for py in y + 2..y + size - 2 {
+                if x + 2 < WINDOW_WIDTH { buffer[py * WINDOW_WIDTH + x + 2] = COLOR_OUTLINE; }
+                if x + size - 3 < WINDOW_WIDTH { buffer[py * WINDOW_WIDTH + x + size - 3] = COLOR_OUTLINE; }
+            }
+        }
+        ButtonIcon::PSilicon => {
+            // Yellow filled square
+            for py in y + 2..y + size - 2 {
+                for px in x + 2..x + size - 2 {
+                    if px < WINDOW_WIDTH && py < WINDOW_HEIGHT {
+                        buffer[py * WINDOW_WIDTH + px] = COLOR_P_TYPE;
+                    }
+                }
+            }
+            // Black outline
+            for px in x + 2..x + size - 2 {
+                if y + 2 < WINDOW_HEIGHT { buffer[(y + 2) * WINDOW_WIDTH + px] = COLOR_OUTLINE; }
+                if y + size - 3 < WINDOW_HEIGHT { buffer[(y + size - 3) * WINDOW_WIDTH + px] = COLOR_OUTLINE; }
+            }
+            for py in y + 2..y + size - 2 {
+                if x + 2 < WINDOW_WIDTH { buffer[py * WINDOW_WIDTH + x + 2] = COLOR_OUTLINE; }
+                if x + size - 3 < WINDOW_WIDTH { buffer[py * WINDOW_WIDTH + x + size - 3] = COLOR_OUTLINE; }
+            }
+        }
+        ButtonIcon::Metal => {
+            // Gray layered rectangles (like original)
+            let colors = [0xcccccc, 0xaaaaaa, 0x888888];
+            for (i, &color) in colors.iter().enumerate() {
+                let offset = i * 3;
+                for py in y + 4 + offset..y + 12 + offset {
+                    for px in x + 3..x + size - 3 {
+                        if px < WINDOW_WIDTH && py < WINDOW_HEIGHT {
+                            buffer[py * WINDOW_WIDTH + px] = color;
+                        }
+                    }
+                }
+            }
+        }
+        ButtonIcon::Via => {
+            // Circle/ring
+            let cx = x + size / 2;
+            let cy = y + size / 2;
+            let outer_r = 7i32;
+            let inner_r = 4i32;
+            for dy in -outer_r..=outer_r {
+                for dx in -outer_r..=outer_r {
+                    let dist_sq = dx * dx + dy * dy;
+                    let px = (cx as i32 + dx) as usize;
+                    let py = (cy as i32 + dy) as usize;
+                    if px < WINDOW_WIDTH && py < WINDOW_HEIGHT {
+                        if dist_sq <= outer_r * outer_r && dist_sq >= inner_r * inner_r {
+                            buffer[py * WINDOW_WIDTH + px] = COLOR_VIA;
+                        }
+                    }
+                }
+            }
+        }
+        ButtonIcon::DeleteX => {
+            // Red X
+            let cx = x + size / 2;
+            let cy = y + size / 2;
+            for i in 0..12i32 {
+                for t in -1..=1 {
+                    let px1 = (cx as i32 - 5 + i) as usize;
+                    let py1 = (cy as i32 - 5 + i + t) as usize;
+                    let px2 = (cx as i32 + 5 - i) as usize;
+                    let py2 = (cy as i32 - 5 + i + t) as usize;
+                    if px1 < WINDOW_WIDTH && py1 < WINDOW_HEIGHT {
+                        buffer[py1 * WINDOW_WIDTH + px1] = COLOR_DELETE_X;
+                    }
+                    if px2 < WINDOW_WIDTH && py2 < WINDOW_HEIGHT {
+                        buffer[py2 * WINDOW_WIDTH + px2] = COLOR_DELETE_X;
+                    }
+                }
+            }
+        }
+        ButtonIcon::Select => {
+            // Dashed rectangle
+            for px in x + 4..x + size - 4 {
+                if (px - x) % 4 < 2 {
+                    if y + 4 < WINDOW_HEIGHT { buffer[(y + 4) * WINDOW_WIDTH + px] = COLOR_OUTLINE; }
+                    if y + size - 5 < WINDOW_HEIGHT { buffer[(y + size - 5) * WINDOW_WIDTH + px] = COLOR_OUTLINE; }
+                }
+            }
+            for py in y + 4..y + size - 4 {
+                if (py - y) % 4 < 2 {
+                    if x + 4 < WINDOW_WIDTH { buffer[py * WINDOW_WIDTH + x + 4] = COLOR_OUTLINE; }
+                    if x + size - 5 < WINDOW_WIDTH { buffer[py * WINDOW_WIDTH + x + size - 5] = COLOR_OUTLINE; }
+                }
+            }
+        }
+    }
 }
 
 /// Draw a semi-transparent overlay on a cell
@@ -1376,6 +3086,44 @@ fn draw_text(
     let start_y = center_y.saturating_sub(max_height / 2);
 
     let mut cursor_x = start_x;
+    for ch in text.chars() {
+        if let Some(glyph) = font.get(&ch) {
+            for (row_idx, row) in glyph.iter().enumerate() {
+                for (col_idx, &pixel) in row.iter().enumerate() {
+                    if pixel {
+                        let px = cursor_x + col_idx;
+                        let py = start_y + row_idx;
+                        if px < WINDOW_WIDTH && py < WINDOW_HEIGHT {
+                            buffer[py * WINDOW_WIDTH + px] = color;
+                        }
+                    }
+                }
+            }
+            cursor_x += glyph.get(0).map(|r| r.len()).unwrap_or(0) + 1;
+        }
+    }
+}
+
+/// Draw text left-aligned at the given position (x is left edge, y is vertical center)
+fn draw_text_left(
+    text: &str,
+    left_x: usize,
+    center_y: usize,
+    font: &HashMap<char, Vec<Vec<bool>>>,
+    color: u32,
+    buffer: &mut [u32],
+) {
+    // Calculate max height for vertical centering
+    let mut max_height = 0;
+    for ch in text.chars() {
+        if let Some(glyph) = font.get(&ch) {
+            max_height = max_height.max(glyph.len());
+        }
+    }
+
+    let start_y = center_y.saturating_sub(max_height / 2);
+    let mut cursor_x = left_x;
+
     for ch in text.chars() {
         if let Some(glyph) = font.get(&ch) {
             for (row_idx, row) in glyph.iter().enumerate() {
@@ -1467,6 +3215,145 @@ fn render_cell(circuit: &Circuit, grid_x: usize, grid_y: usize, buffer: &mut [u3
     if node.metal {
         let conns = get_layer_connections(circuit, grid_x, grid_y, Layer::Metal);
         draw_layer_alpha(buffer, x_start, y_start, &conns, COLOR_METAL, METAL_ALPHA);
+    }
+}
+
+/// Render a ghost preview of a snippet at the given position
+fn render_snippet_ghost(snippet: &Snippet, dest_x: usize, dest_y: usize, buffer: &mut [u32]) {
+    const GHOST_ALPHA: f32 = 0.5;
+
+    // For each cell in the snippet, draw ghost overlays for materials
+    for (sy, row) in snippet.nodes.iter().enumerate() {
+        for (sx, node) in row.iter().enumerate() {
+            let gx = dest_x + sx;
+            let gy = dest_y + sy;
+
+            // Skip if outside grid
+            if gx >= GRID_WIDTH || gy >= GRID_HEIGHT {
+                continue;
+            }
+
+            let x_start = gx * CELL_SIZE;
+            let y_start = gy * CELL_SIZE;
+
+            // Draw silicon ghost
+            match node.silicon {
+                Silicon::None => {}
+                Silicon::N => {
+                    draw_ghost_fill(buffer, x_start, y_start, COLOR_N_TYPE, GHOST_ALPHA);
+                }
+                Silicon::P => {
+                    draw_ghost_fill(buffer, x_start, y_start, COLOR_P_TYPE, GHOST_ALPHA);
+                }
+                Silicon::Gate { channel } => {
+                    let color = match channel {
+                        SiliconKind::P => COLOR_P_TYPE,
+                        SiliconKind::N => COLOR_N_TYPE,
+                    };
+                    draw_ghost_fill(buffer, x_start, y_start, color, GHOST_ALPHA);
+                }
+            }
+
+            // Draw via ghost
+            if node.via {
+                draw_ghost_fill(buffer, x_start, y_start, 0x808080, GHOST_ALPHA);
+            }
+
+            // Draw metal ghost
+            if node.metal {
+                draw_ghost_fill(buffer, x_start, y_start, COLOR_METAL, GHOST_ALPHA * 0.7);
+            }
+        }
+    }
+
+    // Draw ghost for horizontal edges (just highlight the connection area between cells)
+    for (sy, row) in snippet.h_edges.iter().enumerate() {
+        for (sx, edge) in row.iter().enumerate() {
+            let gx = dest_x + sx;
+            let gy = dest_y + sy;
+            if gx + 1 >= GRID_WIDTH || gy >= GRID_HEIGHT {
+                continue;
+            }
+
+            let x_start = gx * CELL_SIZE;
+            let y_start = gy * CELL_SIZE;
+
+            // Draw edge indicator between cells
+            if edge.n_silicon {
+                draw_ghost_edge_h(buffer, x_start, y_start, COLOR_N_TYPE, GHOST_ALPHA);
+            }
+            if edge.p_silicon {
+                draw_ghost_edge_h(buffer, x_start, y_start, COLOR_P_TYPE, GHOST_ALPHA);
+            }
+            if edge.metal {
+                draw_ghost_edge_h(buffer, x_start, y_start, COLOR_METAL, GHOST_ALPHA * 0.7);
+            }
+        }
+    }
+
+    // Draw ghost for vertical edges
+    for (sy, row) in snippet.v_edges.iter().enumerate() {
+        for (sx, edge) in row.iter().enumerate() {
+            let gx = dest_x + sx;
+            let gy = dest_y + sy;
+            if gx >= GRID_WIDTH || gy + 1 >= GRID_HEIGHT {
+                continue;
+            }
+
+            let x_start = gx * CELL_SIZE;
+            let y_start = gy * CELL_SIZE;
+
+            if edge.n_silicon {
+                draw_ghost_edge_v(buffer, x_start, y_start, COLOR_N_TYPE, GHOST_ALPHA);
+            }
+            if edge.p_silicon {
+                draw_ghost_edge_v(buffer, x_start, y_start, COLOR_P_TYPE, GHOST_ALPHA);
+            }
+            if edge.metal {
+                draw_ghost_edge_v(buffer, x_start, y_start, COLOR_METAL, GHOST_ALPHA * 0.7);
+            }
+        }
+    }
+}
+
+/// Draw a ghost fill for a cell
+fn draw_ghost_fill(buffer: &mut [u32], x_start: usize, y_start: usize, color: u32, alpha: f32) {
+    let margin = CELL_SIZE / 4;
+    for y in (y_start + margin)..(y_start + CELL_SIZE - margin) {
+        for x in (x_start + margin)..(x_start + CELL_SIZE - margin) {
+            if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                let idx = y * WINDOW_WIDTH + x;
+                buffer[idx] = alpha_blend(color, buffer[idx], alpha);
+            }
+        }
+    }
+}
+
+/// Draw ghost indicator for horizontal edge (right side of cell)
+fn draw_ghost_edge_h(buffer: &mut [u32], x_start: usize, y_start: usize, color: u32, alpha: f32) {
+    let margin = CELL_SIZE / 4;
+    let edge_x = x_start + CELL_SIZE - 2;
+    for y in (y_start + margin)..(y_start + CELL_SIZE - margin) {
+        for x in edge_x..(edge_x + 4) {
+            if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                let idx = y * WINDOW_WIDTH + x;
+                buffer[idx] = alpha_blend(color, buffer[idx], alpha);
+            }
+        }
+    }
+}
+
+/// Draw ghost indicator for vertical edge (bottom of cell)
+fn draw_ghost_edge_v(buffer: &mut [u32], x_start: usize, y_start: usize, color: u32, alpha: f32) {
+    let margin = CELL_SIZE / 4;
+    let edge_y = y_start + CELL_SIZE - 2;
+    for y in edge_y..(edge_y + 4) {
+        for x in (x_start + margin)..(x_start + CELL_SIZE - margin) {
+            if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                let idx = y * WINDOW_WIDTH + x;
+                buffer[idx] = alpha_blend(color, buffer[idx], alpha);
+            }
+        }
     }
 }
 
