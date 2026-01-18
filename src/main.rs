@@ -1,9 +1,10 @@
 use minifb::{Key, Window, WindowOptions};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // Grid dimensions (matches original game)
@@ -24,7 +25,7 @@ const BUTTON_MARGIN: usize = 4;
 // Bottom area for help text, tabs, and content panel
 const HELP_AREA_HEIGHT: usize = 20;
 const TAB_HEIGHT: usize = 24;
-const TAB_CONTENT_HEIGHT: usize = 120;  // Content area below tabs
+const TAB_CONTENT_HEIGHT: usize = 200;  // Content area below tabs
 const BOTTOM_AREA_HEIGHT: usize = HELP_AREA_HEIGHT + TAB_HEIGHT + TAB_CONTENT_HEIGHT;
 
 // Window size includes grid + panel + bottom area
@@ -135,6 +136,7 @@ enum Tab {
 enum DialogState {
     None,
     SaveSnippet { name: String },  // Entering name for a new snippet
+    SaveDesign { name: String },   // Entering name for a new design
 }
 
 /// A saved design snippet - a rectangular region of circuit
@@ -182,12 +184,22 @@ struct EditorState {
     selected_snippet: usize,
     snippets_dir: PathBuf,
 
+    // Designs (full circuit saves)
+    designs: Vec<Snippet>,  // Reuse Snippet struct for full designs
+    selected_design: usize,
+    designs_dir: PathBuf,
+
+    // Levels (verification challenges)
+    levels: Vec<Level>,
+    selected_level: usize,
+    levels_dir: PathBuf,
+
     // Yank buffer for paste operations
     yank_buffer: Option<Snippet>,
 }
 
 impl EditorState {
-    fn new(snippets_dir: PathBuf) -> Self {
+    fn new(snippets_dir: PathBuf, designs_dir: PathBuf, levels_dir: PathBuf) -> Self {
         Self {
             mode: EditMode::Visual,  // Start in visual mode
             visual_state: VisualState::Normal,
@@ -205,6 +217,12 @@ impl EditorState {
             snippets: Vec::new(),
             selected_snippet: 0,
             snippets_dir,
+            designs: Vec::new(),
+            selected_design: 0,
+            designs_dir,
+            levels: Vec::new(),
+            selected_level: 0,
+            levels_dir,
             yank_buffer: None,
         }
     }
@@ -244,6 +262,52 @@ impl Pin {
             y,
         }
     }
+}
+
+/// A waveform is a sequence of 0/1 values over discrete time steps
+#[derive(Clone, Debug, Deserialize)]
+struct Waveform {
+    pin_index: usize,      // Which pin (0-11)
+    is_input: bool,        // true = input to circuit, false = expected output
+    values: String,        // Signal values as string of '0' and '1' chars
+    #[serde(default = "default_true")]
+    display: bool,         // Whether to show in verification tab (default: true)
+}
+
+fn default_true() -> bool { true }
+
+/// A level defines a verification challenge
+#[derive(Clone, Debug, Deserialize)]
+struct Level {
+    name: String,
+    pins: Vec<String>,            // Labels for all 12 pins
+    waveforms: Vec<Waveform>,     // Input and expected output waveforms
+}
+
+impl Level {
+    /// Load a level from a JSON file
+    fn load(path: &Path) -> Option<Self> {
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+}
+
+/// Load all levels from a directory
+fn load_all_levels(dir: &Path) -> Vec<Level> {
+    let mut levels = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                if let Some(level) = Level::load(&path) {
+                    levels.push(level);
+                }
+            }
+        }
+    }
+    // Sort by name
+    levels.sort_by(|a, b| a.name.cmp(&b.name));
+    levels
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,6 +453,318 @@ impl Circuit {
 }
 
 // ============================================================================
+// Circuit Simulation
+// ============================================================================
+
+/// Simulation state for the circuit
+struct SimState {
+    metal_high: [[bool; GRID_WIDTH]; GRID_HEIGHT],
+    n_silicon_high: [[bool; GRID_WIDTH]; GRID_HEIGHT],
+    p_silicon_high: [[bool; GRID_WIDTH]; GRID_HEIGHT],
+    gate_open: [[bool; GRID_WIDTH]; GRID_HEIGHT],  // From previous tick
+    tick: usize,
+    output_history: Vec<[bool; 12]>,  // History of output pin values for each tick
+}
+
+impl SimState {
+    fn new() -> Self {
+        Self {
+            metal_high: [[false; GRID_WIDTH]; GRID_HEIGHT],
+            n_silicon_high: [[false; GRID_WIDTH]; GRID_HEIGHT],
+            p_silicon_high: [[false; GRID_WIDTH]; GRID_HEIGHT],
+            gate_open: [[false; GRID_WIDTH]; GRID_HEIGHT],
+            tick: 0,
+            output_history: Vec::new(),
+        }
+    }
+
+    /// Run one simulation tick
+    /// pin_values: for each pin index (0-11), whether it's driven high
+    fn step(&mut self, circuit: &Circuit, pins: &[Pin], pin_values: &[bool; 12]) {
+        // Step 1: Propagate signals using gate states from previous tick
+        self.propagate(circuit, pins, pin_values);
+
+        // Step 2: Update gate states for next tick based on current signals
+        self.update_gates(circuit);
+
+        // Step 3: Record output pin values for history
+        let mut output_values = [false; 12];
+        for (i, pin) in pins.iter().enumerate() {
+            if i < 12 {
+                output_values[i] = self.metal_high[pin.y][pin.x];
+            }
+        }
+        self.output_history.push(output_values);
+
+        self.tick += 1;
+    }
+
+    /// Propagate signals through the circuit
+    fn propagate(&mut self, circuit: &Circuit, pins: &[Pin], pin_values: &[bool; 12]) {
+        // Reset all signals to low
+        self.metal_high = [[false; GRID_WIDTH]; GRID_HEIGHT];
+        self.n_silicon_high = [[false; GRID_WIDTH]; GRID_HEIGHT];
+        self.p_silicon_high = [[false; GRID_WIDTH]; GRID_HEIGHT];
+
+        // Queue for BFS propagation
+        let mut metal_queue: VecDeque<(usize, usize)> = VecDeque::new();
+        let mut n_silicon_queue: VecDeque<(usize, usize)> = VecDeque::new();
+        let mut p_silicon_queue: VecDeque<(usize, usize)> = VecDeque::new();
+
+        // Drive pins according to waveform values
+        for (i, pin) in pins.iter().enumerate() {
+            if i < 12 && pin_values[i] {
+                // Pin is high - drive all metal cells in the 3x3 pin area
+                for dy in 0..PIN_SIZE {
+                    for dx in 0..PIN_SIZE {
+                        let x = pin.x + dx;
+                        let y = pin.y + dy;
+                        if x < GRID_WIDTH && y < GRID_HEIGHT {
+                            if !self.metal_high[y][x] {
+                                self.metal_high[y][x] = true;
+                                metal_queue.push_back((x, y));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Iterate until no changes (fixed-point)
+        // This is needed because: metal -> via -> silicon -> via -> metal -> ...
+        loop {
+            let mut changed = false;
+
+            // Propagate metal signals
+            while let Some((x, y)) = metal_queue.pop_front() {
+                // Check all 4 neighbors for metal connections
+                let neighbors = [
+                    (x.wrapping_sub(1), y, true),  // left, horizontal edge
+                    (x + 1, y, true),              // right, horizontal edge
+                    (x, y.wrapping_sub(1), false), // up, vertical edge
+                    (x, y + 1, false),             // down, vertical edge
+                ];
+
+                for (nx, ny, is_horizontal) in neighbors {
+                    if nx >= GRID_WIDTH || ny >= GRID_HEIGHT {
+                        continue;
+                    }
+
+                    // Check if there's a metal edge connection
+                    let has_edge = if is_horizontal {
+                        let edge_x = x.min(nx);
+                        circuit.h_edges.get(y).and_then(|row| row.get(edge_x)).map(|e| e.metal).unwrap_or(false)
+                    } else {
+                        let edge_y = y.min(ny);
+                        circuit.v_edges.get(edge_y).and_then(|row| row.get(x)).map(|e| e.metal).unwrap_or(false)
+                    };
+
+                    if has_edge && !self.metal_high[ny][nx] {
+                        self.metal_high[ny][nx] = true;
+                        metal_queue.push_back((nx, ny));
+                        changed = true;
+                    }
+                }
+
+                // If there's a via here, propagate to silicon
+                if let Some(node) = circuit.get_node(x, y) {
+                    if node.via {
+                        match node.silicon {
+                            Silicon::N => {
+                                if !self.n_silicon_high[y][x] {
+                                    self.n_silicon_high[y][x] = true;
+                                    n_silicon_queue.push_back((x, y));
+                                    changed = true;
+                                }
+                            }
+                            Silicon::P => {
+                                if !self.p_silicon_high[y][x] {
+                                    self.p_silicon_high[y][x] = true;
+                                    p_silicon_queue.push_back((x, y));
+                                    changed = true;
+                                }
+                            }
+                            Silicon::Gate { channel } => {
+                                // Via on a gate - signal goes to the channel type
+                                match channel {
+                                    SiliconKind::N => {
+                                        if !self.n_silicon_high[y][x] {
+                                            self.n_silicon_high[y][x] = true;
+                                            n_silicon_queue.push_back((x, y));
+                                            changed = true;
+                                        }
+                                    }
+                                    SiliconKind::P => {
+                                        if !self.p_silicon_high[y][x] {
+                                            self.p_silicon_high[y][x] = true;
+                                            p_silicon_queue.push_back((x, y));
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            Silicon::None => {}
+                        }
+                    }
+                }
+            }
+
+            // Propagate N-silicon signals
+            while let Some((x, y)) = n_silicon_queue.pop_front() {
+                if self.propagate_silicon(circuit, x, y, SiliconKind::N, &mut n_silicon_queue, &mut metal_queue) {
+                    changed = true;
+                }
+            }
+
+            // Propagate P-silicon signals
+            while let Some((x, y)) = p_silicon_queue.pop_front() {
+                if self.propagate_silicon(circuit, x, y, SiliconKind::P, &mut p_silicon_queue, &mut metal_queue) {
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// Propagate silicon signal from a node
+    /// Returns true if any changes were made
+    fn propagate_silicon(&mut self, circuit: &Circuit, x: usize, y: usize, kind: SiliconKind, queue: &mut VecDeque<(usize, usize)>, metal_queue: &mut VecDeque<(usize, usize)>) -> bool {
+        let mut changed = false;
+
+        // If this silicon node has a via and metal isn't already high, propagate up to metal
+        if let Some(node) = circuit.get_node(x, y) {
+            if node.via && !self.metal_high[y][x] {
+                self.metal_high[y][x] = true;
+                metal_queue.push_back((x, y));
+                changed = true;
+            }
+        }
+
+        let neighbors = [
+            (x.wrapping_sub(1), y, true),  // left
+            (x + 1, y, true),              // right
+            (x, y.wrapping_sub(1), false), // up
+            (x, y + 1, false),             // down
+        ];
+
+        for (nx, ny, is_horizontal) in neighbors {
+            if nx >= GRID_WIDTH || ny >= GRID_HEIGHT {
+                continue;
+            }
+
+            // Check if there's a silicon edge connection of this type
+            let has_edge = if is_horizontal {
+                let edge_x = x.min(nx);
+                circuit.h_edges.get(y).and_then(|row| row.get(edge_x)).map(|e| {
+                    match kind {
+                        SiliconKind::N => e.n_silicon,
+                        SiliconKind::P => e.p_silicon,
+                    }
+                }).unwrap_or(false)
+            } else {
+                let edge_y = y.min(ny);
+                circuit.v_edges.get(edge_y).and_then(|row| row.get(x)).map(|e| {
+                    match kind {
+                        SiliconKind::N => e.n_silicon,
+                        SiliconKind::P => e.p_silicon,
+                    }
+                }).unwrap_or(false)
+            };
+
+            if !has_edge {
+                continue;
+            }
+
+            // Check if neighbor is already high
+            let neighbor_high = match kind {
+                SiliconKind::N => self.n_silicon_high[ny][nx],
+                SiliconKind::P => self.p_silicon_high[ny][nx],
+            };
+            if neighbor_high {
+                continue;
+            }
+
+            // Check if neighbor is a gate that blocks us
+            if let Some(neighbor_node) = circuit.get_node(nx, ny) {
+                if let Silicon::Gate { channel } = neighbor_node.silicon {
+                    if channel == kind {
+                        // This is a gate of our silicon type - check if it's open
+                        if !self.gate_open[ny][nx] {
+                            continue; // Gate is closed, can't propagate through
+                        }
+                    }
+                    // If channel != kind, this gate doesn't block us (we're the gate control)
+                }
+            }
+
+            // Also check if current node is a gate that blocks outgoing signal
+            if let Some(current_node) = circuit.get_node(x, y) {
+                if let Silicon::Gate { channel } = current_node.silicon {
+                    if channel == kind {
+                        // Current node is a gate of our type - check if open
+                        if !self.gate_open[y][x] {
+                            continue; // Can't propagate out of closed gate
+                        }
+                    }
+                }
+            }
+
+            // Propagate signal
+            match kind {
+                SiliconKind::N => self.n_silicon_high[ny][nx] = true,
+                SiliconKind::P => self.p_silicon_high[ny][nx] = true,
+            }
+            queue.push_back((nx, ny));
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Update gate open/close states based on current signals
+    fn update_gates(&mut self, circuit: &Circuit) {
+        for y in 0..GRID_HEIGHT {
+            for x in 0..GRID_WIDTH {
+                if let Some(node) = circuit.get_node(x, y) {
+                    if let Silicon::Gate { channel } = node.silicon {
+                        // Gate signal comes from the opposite silicon type
+                        let gate_signal = match channel {
+                            SiliconKind::N => self.p_silicon_high[y][x], // N-channel, gate is P
+                            SiliconKind::P => self.n_silicon_high[y][x], // P-channel, gate is N
+                        };
+
+                        // N-channel opens when gate is HIGH
+                        // P-channel opens when gate is LOW
+                        self.gate_open[y][x] = match channel {
+                            SiliconKind::N => gate_signal,
+                            SiliconKind::P => !gate_signal,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get the signal state at a pin location (reads metal signal)
+    fn get_pin_signal(&self, pin: &Pin) -> bool {
+        // Check if any cell in the pin's 3x3 area has high metal
+        for dy in 0..PIN_SIZE {
+            for dx in 0..PIN_SIZE {
+                let x = pin.x + dx;
+                let y = pin.y + dy;
+                if x < GRID_WIDTH && y < GRID_HEIGHT && self.metal_high[y][x] {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// ============================================================================
 // BFS Pathfinding
 // ============================================================================
 
@@ -432,6 +808,10 @@ fn find_path(start: (usize, usize), end: (usize, usize), circuit: &Circuit, laye
 
         for (nx, ny) in neighbors {
             if nx < GRID_WIDTH && ny < GRID_HEIGHT && !visited[ny][nx] {
+                // Check if this cell is in non-playable area (pins, borders)
+                // Allow start/end points even if non-playable (they might be pins)
+                let in_nonplayable = !is_playable(nx, ny) && (nx, ny) != start && (nx, ny) != end;
+
                 // Check if this cell is blocked by existing material
                 let blocked = if let Some(node) = circuit.get_node(nx, ny) {
                     match layer {
@@ -444,7 +824,7 @@ fn find_path(start: (usize, usize), end: (usize, usize), circuit: &Circuit, laye
                 };
 
                 // Allow the end point even if it's "blocked"
-                if !blocked || (nx, ny) == end {
+                if !in_nonplayable && (!blocked || (nx, ny) == end) {
                     visited[ny][nx] = true;
                     parent[ny][nx] = Some((x, y));
                     queue.push_back((nx, ny));
@@ -564,25 +944,25 @@ fn place_silicon_path(circuit: &mut Circuit, path: &[(usize, usize)], silicon_ty
 
     for i in 0..path.len() {
         let (x, y) = path[i];
-        if !is_playable(x, y) {
-            continue;
+
+        // Place silicon on node (only if playable)
+        if is_playable(x, y) {
+            // Determine if this step is vertical movement
+            let is_vertical = if i > 0 {
+                let (_, py) = path[i - 1];
+                py != y  // Vertical if y changed
+            } else if path.len() > 1 {
+                let (_, ny) = path[1];
+                ny != y
+            } else {
+                false
+            };
+
+            // Place silicon (with gate detection)
+            place_silicon_at(circuit, x, y, silicon_type, is_vertical);
         }
 
-        // Determine if this step is vertical movement
-        let is_vertical = if i > 0 {
-            let (_, py) = path[i - 1];
-            py != y  // Vertical if y changed
-        } else if path.len() > 1 {
-            let (_, ny) = path[1];
-            ny != y
-        } else {
-            false
-        };
-
-        // Place silicon (with gate detection)
-        place_silicon_at(circuit, x, y, silicon_type, is_vertical);
-
-        // Connect to previous node in path
+        // Connect to previous node in path (always, even for non-playable)
         if i > 0 {
             let (px, py) = path[i - 1];
             circuit.set_edge(px, py, x, y, layer, true);
@@ -594,16 +974,15 @@ fn place_silicon_path(circuit: &mut Circuit, path: &[(usize, usize)], silicon_ty
 fn place_metal_path(circuit: &mut Circuit, path: &[(usize, usize)]) {
     for i in 0..path.len() {
         let (x, y) = path[i];
-        if !is_playable(x, y) {
-            continue;
+
+        // Place metal on node (only if playable - pins already have metal)
+        if is_playable(x, y) {
+            if let Some(node) = circuit.get_node_mut(x, y) {
+                node.metal = true;
+            }
         }
 
-        // Place node
-        if let Some(node) = circuit.get_node_mut(x, y) {
-            node.metal = true;
-        }
-
-        // Connect to previous node in path
+        // Connect to previous node in path (always, even for pins)
         if i > 0 {
             let (px, py) = path[i - 1];
             circuit.set_edge(px, py, x, y, Layer::Metal, true);
@@ -812,6 +1191,42 @@ fn yank_region(circuit: &Circuit, x1: usize, y1: usize, x2: usize, y2: usize, na
         h_edges,
         v_edges,
     }
+}
+
+/// Yank the entire circuit as a design
+fn yank_entire_circuit(circuit: &Circuit, name: String) -> Snippet {
+    yank_region(circuit, 0, 0, GRID_WIDTH - 1, GRID_HEIGHT - 1, name)
+}
+
+/// Load a design into the circuit, replacing current content
+fn load_design_to_circuit(circuit: &mut Circuit, design: &Snippet, pins: &[Pin]) {
+    // Clear the entire circuit first
+    for y in 0..GRID_HEIGHT {
+        for x in 0..GRID_WIDTH {
+            if let Some(node) = circuit.get_node_mut(x, y) {
+                node.silicon = Silicon::None;
+                node.via = false;
+                node.metal = false;
+            }
+            // Clear edges
+            if x + 1 < GRID_WIDTH {
+                if let Some(edge) = circuit.get_edge_mut(x, y, x + 1, y) {
+                    *edge = Edge::default();
+                }
+            }
+            if y + 1 < GRID_HEIGHT {
+                if let Some(edge) = circuit.get_edge_mut(x, y, x, y + 1) {
+                    *edge = Edge::default();
+                }
+            }
+        }
+    }
+
+    // Paste the design at (0,0)
+    paste_snippet(circuit, design, 0, 0);
+
+    // Re-setup pins (they should have metal)
+    setup_pins(circuit, pins);
 }
 
 /// Rotate a snippet 90 degrees clockwise
@@ -1131,13 +1546,25 @@ fn main() {
     } else {
         PathBuf::from(".snippits")
     };
+    let designs_dir = if args.len() > 2 {
+        PathBuf::from(&args[2])
+    } else {
+        PathBuf::from(".designs")
+    };
+    let levels_dir = if args.len() > 3 {
+        PathBuf::from(&args[3])
+    } else {
+        PathBuf::from("levels")
+    };
 
     let mut buffer: Vec<u32> = vec![0; WINDOW_WIDTH * WINDOW_HEIGHT];
     let mut circuit = Circuit::new();
-    let mut editor = EditorState::new(snippets_dir.clone());
+    let mut editor = EditorState::new(snippets_dir.clone(), designs_dir.clone(), levels_dir.clone());
 
-    // Load existing snippets from disk
+    // Load existing snippets, designs, and levels from disk
     editor.snippets = load_all_snippets(&snippets_dir);
+    editor.designs = load_all_snippets(&designs_dir);
+    editor.levels = load_all_levels(&levels_dir);
 
     // Load font for pin labels
     let font = load_font("terminus/ter-u14b.bdf");
@@ -1148,6 +1575,13 @@ fn main() {
 
     // Add some test patterns to visualize
     setup_test_pattern(&mut circuit);
+
+    // Simulation state
+    let mut sim = SimState::new();
+    let mut sim_last_tick = Instant::now();
+    let sim_tick_duration = Duration::from_millis(150); // 9/60 seconds = 150ms
+    let mut sim_running = false;
+    let mut sim_waveform_index = 0;  // Current position in waveform
 
     let mut window = Window::new(
         "CXEMA",
@@ -1230,7 +1664,7 @@ fn main() {
         }
 
         // Handle input
-        handle_input(&mut circuit, &mut editor, &new_keys, &window);
+        handle_input(&mut circuit, &mut editor, &new_keys, &window, &pins);
 
         // Get current mouse button states
         let left_down = window.get_mouse_down(minifb::MouseButton::Left);
@@ -1297,8 +1731,53 @@ fn main() {
         // Handle mouse clicks with debouncing (only for grid area)
         handle_mouse(&mut circuit, &mut editor, left_clicked, right_clicked, left_down, right_down);
 
+        // Toggle simulation with Space when on Verification tab
+        if new_keys.contains(&Key::Space) && editor.active_tab == Tab::Verification {
+            sim_running = !sim_running;
+            if sim_running {
+                // Reset simulation state when starting
+                sim = SimState::new();
+                sim_waveform_index = 0;
+                sim_last_tick = now;
+            }
+        }
+
+        // Run simulation ticks
+        if sim_running {
+            if now.duration_since(sim_last_tick) >= sim_tick_duration {
+                sim_last_tick = now;
+
+                // Get pin values from current level's waveforms
+                let mut pin_values = [false; 12];
+                if let Some(level) = editor.levels.get(editor.selected_level) {
+                    for waveform in &level.waveforms {
+                        if waveform.is_input && waveform.pin_index < 12 {
+                            // Get value at current waveform index
+                            let value = waveform.values.chars().nth(sim_waveform_index)
+                                .map(|c| c == '1')
+                                .unwrap_or(false);
+                            pin_values[waveform.pin_index] = value;
+                        }
+                    }
+
+                    // Run simulation step
+                    sim.step(&circuit, &pins, &pin_values);
+
+                    // Advance waveform index
+                    let max_len = level.waveforms.iter()
+                        .map(|w| w.values.len())
+                        .max()
+                        .unwrap_or(0);
+                    sim_waveform_index += 1;
+                    if sim_waveform_index >= max_len {
+                        sim_running = false; // Stop at end
+                    }
+                }
+            }
+        }
+
         // Render
-        render(&circuit, &editor, &pins, &font, &mut buffer);
+        render(&circuit, &editor, &pins, &font, &sim, sim_running, sim_waveform_index, &mut buffer);
 
         window
             .update_with_buffer(&buffer, WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -1365,7 +1844,8 @@ fn prev_tab(tab: Tab) -> Tab {
         Tab::Specifications => Tab::Menu,
         Tab::Verification => Tab::Specifications,
         Tab::DesignSnippets => Tab::Verification,
-        Tab::Help => Tab::DesignSnippets,
+        Tab::Designs => Tab::DesignSnippets,
+        Tab::Help => Tab::Designs,
         Tab::Menu => Tab::Help,
     }
 }
@@ -1375,14 +1855,15 @@ fn next_tab(tab: Tab) -> Tab {
     match tab {
         Tab::Specifications => Tab::Verification,
         Tab::Verification => Tab::DesignSnippets,
-        Tab::DesignSnippets => Tab::Help,
+        Tab::DesignSnippets => Tab::Designs,
+        Tab::Designs => Tab::Help,
         Tab::Help => Tab::Menu,
         Tab::Menu => Tab::Specifications,
     }
 }
 
 /// Handle keyboard input
-fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, new_keys: &[Key], window: &Window) {
+fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, new_keys: &[Key], window: &Window, pins: &[Pin]) {
     // Check if modifier keys are held
     let shift_held = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
     let ctrl_held = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
@@ -1423,6 +1904,41 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, new_keys: &[Key
         return; // Don't process other input while dialog is open
     }
 
+    // Handle SaveDesign dialog
+    if let DialogState::SaveDesign { ref mut name } = editor.dialog {
+        for key in new_keys {
+            match key {
+                Key::Enter => {
+                    // Save the design with the entered name
+                    let design_name = if name.is_empty() { "design".to_string() } else { name.clone() };
+                    let design = yank_entire_circuit(circuit, design_name);
+                    // Save to disk
+                    if let Err(e) = save_snippet_to_file(&design, &editor.designs_dir) {
+                        eprintln!("Failed to save design: {}", e);
+                    }
+                    editor.designs.push(design);
+                    editor.selected_design = editor.designs.len() - 1;
+                    editor.dialog = DialogState::None;
+                    return;
+                }
+                Key::Escape => {
+                    editor.dialog = DialogState::None;
+                    return;
+                }
+                Key::Backspace => {
+                    name.pop();
+                }
+                _ => {
+                    // Try to get character for the key
+                    if let Some(c) = key_to_char(*key, shift_held) {
+                        name.push(c);
+                    }
+                }
+            }
+        }
+        return; // Don't process other input while dialog is open
+    }
+
     for key in new_keys {
         // Shift + arrow keys for tab switching
         if shift_held {
@@ -1435,36 +1951,70 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, new_keys: &[Key
                     editor.active_tab = next_tab(editor.active_tab);
                     continue;
                 }
-                // Shift + up/down for within-tab navigation (snippet selection)
+                // Shift + up/down for within-tab navigation (snippet/design/level selection)
                 Key::Up | Key::K => {
                     if editor.active_tab == Tab::DesignSnippets && !editor.snippets.is_empty() {
                         editor.selected_snippet = editor.selected_snippet.saturating_sub(1);
+                    } else if editor.active_tab == Tab::Designs && !editor.designs.is_empty() {
+                        editor.selected_design = editor.selected_design.saturating_sub(1);
+                    } else if editor.active_tab == Tab::Verification && !editor.levels.is_empty() {
+                        editor.selected_level = editor.selected_level.saturating_sub(1);
                     }
                     continue;
                 }
                 Key::Down | Key::J => {
                     if editor.active_tab == Tab::DesignSnippets && !editor.snippets.is_empty() {
                         editor.selected_snippet = (editor.selected_snippet + 1).min(editor.snippets.len() - 1);
+                    } else if editor.active_tab == Tab::Designs && !editor.designs.is_empty() {
+                        editor.selected_design = (editor.selected_design + 1).min(editor.designs.len() - 1);
+                    } else if editor.active_tab == Tab::Verification && !editor.levels.is_empty() {
+                        editor.selected_level = (editor.selected_level + 1).min(editor.levels.len() - 1);
                     }
                     continue;
                 }
-                // Shift + D to delete selected snippet
+                // Shift + D to delete selected snippet/design
                 Key::D => {
                     if editor.active_tab == Tab::DesignSnippets && !editor.snippets.is_empty() {
                         let idx = editor.selected_snippet;
                         if idx < editor.snippets.len() {
-                            // Delete the file from disk
                             let snippet = &editor.snippets[idx];
                             if let Err(e) = delete_snippet_file(snippet, &editor.snippets_dir) {
                                 eprintln!("Failed to delete snippet file: {}", e);
                             }
-                            // Remove from list
                             editor.snippets.remove(idx);
-                            // Adjust selected index
                             if editor.selected_snippet >= editor.snippets.len() && editor.selected_snippet > 0 {
                                 editor.selected_snippet -= 1;
                             }
                         }
+                    } else if editor.active_tab == Tab::Designs && !editor.designs.is_empty() {
+                        let idx = editor.selected_design;
+                        if idx < editor.designs.len() {
+                            let design = &editor.designs[idx];
+                            if let Err(e) = delete_snippet_file(design, &editor.designs_dir) {
+                                eprintln!("Failed to delete design file: {}", e);
+                            }
+                            editor.designs.remove(idx);
+                            if editor.selected_design >= editor.designs.len() && editor.selected_design > 0 {
+                                editor.selected_design -= 1;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // Shift + R to load selected design (replace current circuit)
+                Key::R => {
+                    if editor.active_tab == Tab::Designs && !editor.designs.is_empty() {
+                        let idx = editor.selected_design;
+                        if let Some(design) = editor.designs.get(idx).cloned() {
+                            load_design_to_circuit(circuit, &design, pins);
+                        }
+                    }
+                    continue;
+                }
+                // Shift + W to save current design
+                Key::W => {
+                    if editor.active_tab == Tab::Designs {
+                        editor.dialog = DialogState::SaveDesign { name: String::new() };
                     }
                     continue;
                 }
@@ -2328,7 +2878,7 @@ fn setup_test_pattern(circuit: &mut Circuit) {
 // Rendering
 // ============================================================================
 
-fn render(circuit: &Circuit, editor: &EditorState, pins: &[Pin], font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
+fn render(circuit: &Circuit, editor: &EditorState, pins: &[Pin], font: &HashMap<char, Vec<Vec<bool>>>, sim: &SimState, sim_running: bool, sim_waveform_index: usize, buffer: &mut [u32]) {
     // Fill background
     for pixel in buffer.iter_mut() {
         *pixel = COLOR_BACKGROUND;
@@ -2341,12 +2891,36 @@ fn render(circuit: &Circuit, editor: &EditorState, pins: &[Pin], font: &HashMap<
         }
     }
 
+    // Draw signal visualization when simulation is running
+    if sim_running {
+        for grid_y in 0..GRID_HEIGHT {
+            for grid_x in 0..GRID_WIDTH {
+                // Highlight cells with high signals
+                let metal_high = sim.metal_high[grid_y][grid_x];
+                let n_high = sim.n_silicon_high[grid_y][grid_x];
+                let p_high = sim.p_silicon_high[grid_y][grid_x];
+
+                if metal_high || n_high || p_high {
+                    // Draw a bright overlay on high signals
+                    let color = if metal_high { 0xffff00 } else if n_high { 0xff8080 } else { 0xffff80 };
+                    draw_cell_overlay(grid_x, grid_y, color, 0.4, buffer);
+                }
+            }
+        }
+    }
+
     // Draw pin labels centered in their 3x3 area
-    for pin in pins {
+    // Use level pin names if a level is selected, otherwise use default pin labels
+    let level_pins = editor.levels.get(editor.selected_level).map(|l| &l.pins);
+    for (i, pin) in pins.iter().enumerate() {
         // Center of 3x3 pin area
         let center_x = pin.x * CELL_SIZE + (PIN_SIZE * CELL_SIZE) / 2;
         let center_y = pin.y * CELL_SIZE + (PIN_SIZE * CELL_SIZE) / 2;
-        draw_text(&pin.label, center_x, center_y, font, COLOR_PIN_TEXT, buffer);
+        let label = level_pins
+            .and_then(|p| p.get(i))
+            .map(|s| s.as_str())
+            .unwrap_or(&pin.label);
+        draw_text(label, center_x, center_y, font, COLOR_PIN_TEXT, buffer);
     }
 
     // Draw path preview (for mouse-based construction modes)
@@ -2427,11 +3001,14 @@ fn render(circuit: &Circuit, editor: &EditorState, pins: &[Pin], font: &HashMap<
     render_panel(editor, font, buffer);
 
     // Draw the bottom area (help text and tabs)
-    render_bottom_area(editor, font, buffer);
+    render_bottom_area(editor, font, sim, sim_running, sim_waveform_index, buffer);
 
     // Draw dialog overlay if open
     if let DialogState::SaveSnippet { ref name } = editor.dialog {
         render_dialog("SAVE DESIGN SNIPPET", "Enter name for snippet:", name, font, buffer);
+    }
+    if let DialogState::SaveDesign { ref name } = editor.dialog {
+        render_dialog("SAVE DESIGN", "Enter name for design:", name, font, buffer);
     }
 }
 
@@ -2565,7 +3142,7 @@ fn get_help_text(editor: &EditorState) -> &'static str {
 }
 
 /// Render the bottom area with help text, tabs, and content
-fn render_bottom_area(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
+fn render_bottom_area(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>, sim: &SimState, sim_running: bool, sim_waveform_index: usize, buffer: &mut [u32]) {
     let help_y = GRID_PIXEL_HEIGHT;
     let tab_y = help_y + HELP_AREA_HEIGHT;
     let content_y = tab_y + TAB_HEIGHT;
@@ -2586,6 +3163,7 @@ fn render_bottom_area(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>
         (Tab::Specifications, "Specs"),
         (Tab::Verification, "Verify"),
         (Tab::DesignSnippets, "Snippets"),
+        (Tab::Designs, "Designs"),
         (Tab::Help, "Help"),
         (Tab::Menu, "Menu"),
     ];
@@ -2621,8 +3199,14 @@ fn render_bottom_area(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>
 
     // Draw tab content
     match editor.active_tab {
+        Tab::Verification => {
+            render_verification_tab(editor, content_y, font, sim, sim_running, sim_waveform_index, buffer);
+        }
         Tab::DesignSnippets => {
             render_snippets_tab(editor, content_y, font, buffer);
+        }
+        Tab::Designs => {
+            render_designs_tab(editor, content_y, font, buffer);
         }
         Tab::Help => {
             let help_lines = [
@@ -2742,6 +3326,198 @@ fn render_snippets_tab(editor: &EditorState, content_y: usize, font: &HashMap<ch
     }
 }
 
+/// Render the designs tab content
+fn render_designs_tab(editor: &EditorState, content_y: usize, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
+    let list_width = WINDOW_WIDTH / 2;
+
+    // Draw divider between list and preview
+    for y in content_y..WINDOW_HEIGHT {
+        if list_width < WINDOW_WIDTH {
+            buffer[y * WINDOW_WIDTH + list_width] = COLOR_BUTTON_DARK;
+        }
+    }
+
+    // Draw design list
+    if editor.designs.is_empty() {
+        draw_text("No designs saved", 10, content_y + 20, font, 0x808080, buffer);
+        draw_text("Press 'w' or Shift+W to save design", 10, content_y + 40, font, 0x808080, buffer);
+    } else {
+        for (i, design) in editor.designs.iter().enumerate() {
+            let item_y = content_y + 8 + i * 18;
+            if item_y + 16 > WINDOW_HEIGHT {
+                break;
+            }
+
+            // Highlight selected design
+            if i == editor.selected_design {
+                for y in item_y - 2..item_y + 14 {
+                    for x in 2..list_width - 2 {
+                        if y < WINDOW_HEIGHT {
+                            buffer[y * WINDOW_WIDTH + x] = 0xa0c0ff; // Light blue highlight
+                        }
+                    }
+                }
+            }
+
+            draw_text(&design.name, 10, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+        }
+    }
+
+    // Draw instructions on the right side
+    let preview_x = list_width + 10;
+    draw_text_left("Shift+J/K: navigate", preview_x, content_y + 20, font, 0x606060, buffer);
+    draw_text_left("Shift+R: load design", preview_x, content_y + 40, font, 0x606060, buffer);
+    draw_text_left("Shift+D: delete design", preview_x, content_y + 60, font, 0x606060, buffer);
+    draw_text_left("Shift+W: save design", preview_x, content_y + 80, font, 0x606060, buffer);
+}
+
+/// Render the verification tab content (levels list and waveforms)
+fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMap<char, Vec<Vec<bool>>>, sim: &SimState, sim_running: bool, sim_waveform_index: usize, buffer: &mut [u32]) {
+    let list_width = 150;
+    let waveform_x = list_width + 10;
+
+    // Draw divider between list and waveform area
+    for y in content_y..WINDOW_HEIGHT {
+        if list_width < WINDOW_WIDTH {
+            buffer[y * WINDOW_WIDTH + list_width] = COLOR_BUTTON_DARK;
+        }
+    }
+
+    // Draw level list
+    if editor.levels.is_empty() {
+        draw_text("No levels found", 10, content_y + 20, font, 0x808080, buffer);
+        draw_text("Add .lvl files to levels/", 10, content_y + 40, font, 0x808080, buffer);
+    } else {
+        for (i, level) in editor.levels.iter().enumerate() {
+            let item_y = content_y + 8 + i * 18;
+            if item_y + 16 > WINDOW_HEIGHT {
+                break;
+            }
+
+            // Highlight selected level
+            if i == editor.selected_level {
+                for y in item_y - 2..item_y + 14 {
+                    for x in 2..list_width - 2 {
+                        if y < WINDOW_HEIGHT {
+                            buffer[y * WINDOW_WIDTH + x] = 0xa0c0ff; // Light blue highlight
+                        }
+                    }
+                }
+            }
+
+            draw_text(&level.name, 10, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+        }
+    }
+
+    // Check if we have simulation output to display
+    let has_sim_output = !sim.output_history.is_empty();
+
+    // Draw waveform preview for selected level
+    if let Some(level) = editor.levels.get(editor.selected_level) {
+        // Draw waveforms
+        let wave_start_y = content_y + 30;
+        let wave_height = 12;
+        let time_step_width = 8;
+        let wave_x_start = waveform_x + 50;
+
+        // Only show waveforms with display: true
+        let displayed_waveforms: Vec<_> = level.waveforms.iter().filter(|w| w.display).collect();
+
+        for (wi, waveform) in displayed_waveforms.iter().enumerate() {
+            let y_base = wave_start_y + wi * (wave_height + 8);
+            if y_base + wave_height > WINDOW_HEIGHT {
+                break;
+            }
+
+            // Label
+            let pin_label = level.pins.get(waveform.pin_index).map(|s| s.as_str()).unwrap_or("?");
+            let direction = if waveform.is_input { "I" } else { "O" };
+            draw_text_left(&format!("{} {}", pin_label, direction), waveform_x, y_base + wave_height / 2, font, 0x404040, buffer);
+
+            // Draw expected waveform (inputs always blue, outputs gray when sim has output, otherwise green)
+            let chars: Vec<char> = waveform.values.chars().collect();
+            for (t, &ch) in chars.iter().enumerate() {
+                let value = ch == '1';
+                let x = wave_x_start + t * time_step_width;
+                let y_high = y_base;
+                let y_low = y_base + wave_height - 2;
+                let y = if value { y_high } else { y_low };
+
+                // Color: blue for inputs, gray for expected outputs when sim running, green otherwise
+                let color = if waveform.is_input {
+                    0x0000ff // Blue for inputs
+                } else if has_sim_output {
+                    0x808080 // Gray for expected outputs when we have sim data
+                } else {
+                    0x00aa00 // Green for outputs when no sim data
+                };
+
+                // Draw horizontal line at current level
+                for dx in 0..time_step_width {
+                    if x + dx < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                        buffer[y * WINDOW_WIDTH + x + dx] = color;
+                    }
+                }
+
+                // Draw vertical transition if needed
+                if t > 0 && (chars[t - 1] == '1') != value {
+                    for dy in y_high..=y_low {
+                        if x < WINDOW_WIDTH && dy < WINDOW_HEIGHT {
+                            buffer[dy * WINDOW_WIDTH + x] = color;
+                        }
+                    }
+                }
+            }
+
+            // Draw actual simulated output on top (in green) for output waveforms
+            if !waveform.is_input && has_sim_output {
+                let pin_idx = waveform.pin_index;
+                for t in 0..sim.output_history.len() {
+                    let value = sim.output_history[t][pin_idx];
+                    let x = wave_x_start + t * time_step_width;
+                    let y_high = y_base;
+                    let y_low = y_base + wave_height - 2;
+                    let y = if value { y_high } else { y_low };
+
+                    // Draw horizontal line at current level (green for actual)
+                    for dx in 0..time_step_width {
+                        if x + dx < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                            buffer[y * WINDOW_WIDTH + x + dx] = 0x00aa00;
+                        }
+                    }
+
+                    // Draw vertical transition if needed
+                    if t > 0 && sim.output_history[t - 1][pin_idx] != value {
+                        for dy in y_high..=y_low {
+                            if x < WINDOW_WIDTH && dy < WINDOW_HEIGHT {
+                                buffer[dy * WINDOW_WIDTH + x] = 0x00aa00;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Draw current simulation position marker
+        if sim_running {
+            let marker_x = wave_x_start + sim_waveform_index * time_step_width;
+            if marker_x < WINDOW_WIDTH {
+                let marker_height = displayed_waveforms.len() * (wave_height + 8) + 10;
+                for y in wave_start_y..WINDOW_HEIGHT.min(wave_start_y + marker_height) {
+                    buffer[y * WINDOW_WIDTH + marker_x] = 0xff0000; // Red vertical line
+                }
+            }
+        }
+    }
+
+    // Show simulation status
+    if sim_running {
+        draw_text_left("RUNNING (Space to stop)", waveform_x, content_y + 10, font, 0x008800, buffer);
+    } else {
+        draw_text_left("Press Space to simulate", waveform_x, content_y + 10, font, 0x606060, buffer);
+    }
+}
+
 /// Check which tab was clicked (if any)
 fn get_clicked_tab(mx: usize, my: usize) -> Option<Tab> {
     let tab_y = GRID_PIXEL_HEIGHT + HELP_AREA_HEIGHT;
@@ -2755,6 +3531,7 @@ fn get_clicked_tab(mx: usize, my: usize) -> Option<Tab> {
         Tab::Specifications,
         Tab::Verification,
         Tab::DesignSnippets,
+        Tab::Designs,
         Tab::Help,
         Tab::Menu,
     ];
