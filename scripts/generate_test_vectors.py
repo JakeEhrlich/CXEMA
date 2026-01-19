@@ -149,7 +149,7 @@ def sim_cx74(inputs: dict, n_ticks: int) -> dict:
 def sim_cxf02(inputs: dict, n_ticks: int) -> dict:
     """CXF02: Frequency doubler
     S=0: Y = CLK (passthrough)
-    S=1: Y pulses on both edges of CLK (XOR with delayed version)
+    S=1: Y = CLK XOR CLK_delayed_by_2 (doubles frequency with 50% duty cycle)
     """
     y = [0] * n_ticks
     for t in range(n_ticks):
@@ -158,9 +158,9 @@ def sim_cxf02(inputs: dict, n_ticks: int) -> dict:
         if not s:
             y[t] = clk
         else:
-            # Edge detection: output 1 when CLK differs from previous
-            prev_clk = inputs['CLK'][t-1] if t > 0 else 0
-            y[t] = clk ^ prev_clk
+            # XOR with 2-tick delayed version for period 4 output
+            delayed_clk = inputs['CLK'][t-2] if t >= 2 else 0
+            y[t] = clk ^ delayed_clk
     return {'Y': y}
 
 
@@ -393,7 +393,7 @@ LEVEL_CONFIG = {
         'inputs': ['CLK', 'S'],
         'outputs': ['Y'],
         'pin_map': {'CLK': 1, 'S': 2, 'Y': 7},
-        'stability_ticks': 2,
+        'stability_ticks': 0,
     },
     'CX139': {
         'sim': sim_cx139,
@@ -407,7 +407,7 @@ LEVEL_CONFIG = {
         'inputs': ['A0', 'A1', 'B0', 'B1', 'CI'],
         'outputs': ['S0', 'S1', 'CO'],
         'pin_map': {'A0': 1, 'A1': 2, 'B0': 3, 'B1': 4, 'CI': 5, 'S0': 7, 'S1': 8, 'CO': 9},
-        'stability_ticks': 2,
+        'stability_ticks': 4,
     },
     'CX93': {
         'sim': sim_cx93,

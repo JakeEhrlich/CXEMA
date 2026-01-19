@@ -1744,6 +1744,7 @@ fn main() {
     let mut sim_last_tick = Instant::now();
     let sim_tick_duration = Duration::from_millis(150); // 9/60 seconds = 150ms
     let mut sim_running = false;
+    let mut sim_paused = false;
     let mut sim_waveform_index = 0;  // Current position in waveform
 
     let mut window = Window::new(
@@ -1827,7 +1828,7 @@ fn main() {
         }
 
         // Handle input
-        handle_input(&mut circuit, &mut editor, &mut sim, &new_keys, &window, &pins);
+        handle_input(&mut circuit, &mut editor, &mut sim, &mut sim_running, &mut sim_paused, &new_keys, &window, &pins);
 
         // Check if music selection changed via keyboard
         if editor.music_changed {
@@ -1908,13 +1909,24 @@ fn main() {
         }
 
         // Handle mouse clicks with debouncing (only for grid area)
-        handle_mouse(&mut circuit, &mut editor, left_clicked, right_clicked, left_down, right_down);
+        let mouse_made_changes = handle_mouse(&mut circuit, &mut editor, left_clicked, right_clicked, left_down, right_down);
+        if mouse_made_changes && sim_running {
+            sim_running = false;
+            sim_paused = false;
+        }
 
         // Toggle simulation with Space when on Verification tab
         if new_keys.contains(&Key::Space) && editor.active_tab == Tab::Verification {
-            sim_running = !sim_running;
             if sim_running {
-                // Reset simulation state when starting
+                // Pause/resume if already running
+                sim_paused = !sim_paused;
+                if !sim_paused {
+                    sim_last_tick = now; // Reset tick timer on resume
+                }
+            } else {
+                // Start fresh simulation
+                sim_running = true;
+                sim_paused = false;
                 sim = SimState::new();
                 sim.init_gates(&circuit);
                 sim_waveform_index = 0;
@@ -1922,8 +1934,14 @@ fn main() {
             }
         }
 
+        // Cancel simulation with Escape
+        if new_keys.contains(&Key::Escape) && sim_running {
+            sim_running = false;
+            sim_paused = false;
+        }
+
         // Run simulation ticks
-        if sim_running {
+        if sim_running && !sim_paused {
             if now.duration_since(sim_last_tick) >= sim_tick_duration {
                 sim_last_tick = now;
 
@@ -1951,6 +1969,7 @@ fn main() {
                     sim_waveform_index += 1;
                     if sim_waveform_index >= max_len {
                         sim_running = false; // Stop at end
+                        sim_paused = false;
 
                         // Calculate accuracy and check for completion
                         // Test mask: 'x' = don't care, '?' or empty = check
@@ -2085,7 +2104,10 @@ fn next_tab(tab: Tab) -> Tab {
 }
 
 /// Handle keyboard input
-fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimState, new_keys: &[Key], window: &Window, pins: &[Pin]) {
+fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimState, sim_running: &mut bool, sim_paused: &mut bool, new_keys: &[Key], window: &Window, pins: &[Pin]) {
+    // Track if any circuit changes are made (to cancel simulation)
+    let mut made_changes = false;
+
     // Check if modifier keys are held
     let shift_held = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
     let ctrl_held = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
@@ -2188,6 +2210,8 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimSt
                         }
                         // Reset simulation state when level changes
                         if editor.selected_level != prev_level {
+                            *sim_running = false;
+                            *sim_paused = false;
                             sim.output_history.clear();
                             sim.last_accuracy = None;
                             sim.last_passed = None;
@@ -2215,6 +2239,8 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimSt
                         }
                         // Reset simulation state when level changes
                         if editor.selected_level != prev_level {
+                            *sim_running = false;
+                            *sim_paused = false;
                             sim.output_history.clear();
                             sim.last_accuracy = None;
                             sim.last_passed = None;
@@ -2332,16 +2358,26 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimSt
 
             // Visual mode keys (only active in Visual mode)
             _ if editor.mode == EditMode::Visual => {
-                handle_visual_mode_key(circuit, editor, *key, shift_held, ctrl_held);
+                if handle_visual_mode_key(circuit, editor, *key, shift_held, ctrl_held) {
+                    made_changes = true;
+                }
             }
 
             // MouseSelect mode keys
             _ if editor.mode == EditMode::MouseSelect => {
-                handle_mouse_select_key(circuit, editor, *key);
+                if handle_mouse_select_key(circuit, editor, *key) {
+                    made_changes = true;
+                }
             }
 
             _ => {}
         }
+    }
+
+    // Cancel simulation if circuit was modified
+    if made_changes && *sim_running {
+        *sim_running = false;
+        *sim_paused = false;
     }
 }
 
@@ -2351,7 +2387,9 @@ const PLAYABLE_RIGHT: usize = 39;
 const PLAYABLE_WIDTH: usize = PLAYABLE_RIGHT - PLAYABLE_LEFT + 1; // 36
 
 /// Handle visual mode keyboard input
-fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key, shift_held: bool, ctrl_held: bool) {
+/// Returns true if circuit was modified
+fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key, shift_held: bool, ctrl_held: bool) -> bool {
+    let mut made_changes = false;
     let prev_x = editor.cursor_x;
     let prev_y = editor.cursor_y;
     let modifier = editor.pending_modifier;
@@ -2415,6 +2453,7 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
                             }
                         }
                     }
+                    made_changes = true;
                     editor.visual_state = VisualState::Normal;
                     editor.selection_anchor = None;
                 } else if is_playable(editor.cursor_x, editor.cursor_y) {
@@ -2423,6 +2462,7 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
                         PendingModifier::Metal => delete_metal(circuit, editor.cursor_x, editor.cursor_y),
                         _ => {}
                     }
+                    made_changes = true;
                 }
                 editor.clear_modifier();
             }
@@ -2446,15 +2486,15 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
             // Prefix modifiers
             Key::S => {
                 editor.pending_modifier = PendingModifier::Silicon;
-                return; // Don't clear modifier or do material placement
+                return false; // Don't clear modifier or do material placement
             }
             Key::M => {
                 editor.pending_modifier = PendingModifier::Metal;
-                return;
+                return false;
             }
             Key::G => {
                 editor.pending_modifier = PendingModifier::Goto;
-                return;
+                return false;
             }
 
             // Movement: hjkl or arrow keys
@@ -2521,10 +2561,12 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
             Key::D => {
                 if let Some((x1, y1, x2, y2)) = editor.get_selection() {
                     delete_region(circuit, x1, y1, x2, y2);
+                    made_changes = true;
                     editor.visual_state = VisualState::Normal;
                     editor.selection_anchor = None;
                 } else if is_playable(editor.cursor_x, editor.cursor_y) {
                     delete_all(circuit, editor.cursor_x, editor.cursor_y);
+                    made_changes = true;
                 }
             }
 
@@ -2553,6 +2595,7 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
                         } else {
                             place_via(circuit, editor.cursor_x, editor.cursor_y);
                         }
+                        made_changes = true;
                     }
                 }
             }
@@ -2577,6 +2620,7 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
 
                 if let Some(snippet) = snippet_to_paste {
                     paste_snippet(circuit, &snippet, editor.cursor_x, editor.cursor_y);
+                    made_changes = true;
                 }
             }
 
@@ -2614,20 +2658,27 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
         match editor.visual_state {
             VisualState::PlacingN => {
                 place_silicon_path(circuit, &[(prev_x, prev_y), (editor.cursor_x, editor.cursor_y)], SiliconKind::N);
+                made_changes = true;
             }
             VisualState::PlacingP => {
                 place_silicon_path(circuit, &[(prev_x, prev_y), (editor.cursor_x, editor.cursor_y)], SiliconKind::P);
+                made_changes = true;
             }
             VisualState::PlacingMetal => {
                 place_metal_path(circuit, &[(prev_x, prev_y), (editor.cursor_x, editor.cursor_y)]);
+                made_changes = true;
             }
             _ => {}
         }
     }
+
+    made_changes
 }
 
 /// Handle keys in MouseSelect mode (y, p, r, d, s, m, Escape)
-fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key) {
+/// Returns true if circuit was modified
+fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key) -> bool {
+    let mut made_changes = false;
     // Check if selection is finalized (both clicks done)
     let selection_finalized = editor.selection_anchor.is_some() && editor.mouse_selection_end.is_some();
 
@@ -2644,16 +2695,17 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
                                     delete_silicon(circuit, x, y);
                                 }
                             }
+                            made_changes = true;
                             editor.selection_anchor = None;
                             editor.mouse_selection_end = None;
                         }
                     }
                     editor.clear_modifier();
-                    return;
+                    return made_changes;
                 }
                 Key::Escape => {
                     editor.clear_modifier();
-                    return;
+                    return false;
                 }
                 _ => {
                     editor.clear_modifier();
@@ -2671,16 +2723,17 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
                                     delete_metal(circuit, x, y);
                                 }
                             }
+                            made_changes = true;
                             editor.selection_anchor = None;
                             editor.mouse_selection_end = None;
                         }
                     }
                     editor.clear_modifier();
-                    return;
+                    return made_changes;
                 }
                 Key::Escape => {
                     editor.clear_modifier();
-                    return;
+                    return false;
                 }
                 _ => {
                     editor.clear_modifier();
@@ -2718,6 +2771,7 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
 
             if let Some(snippet) = snippet_to_paste {
                 paste_snippet(circuit, &snippet, editor.cursor_x, editor.cursor_y);
+                made_changes = true;
             }
         }
 
@@ -2742,6 +2796,7 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
                             delete_all(circuit, x, y);
                         }
                     }
+                    made_changes = true;
                     editor.selection_anchor = None;
                     editor.mouse_selection_end = None;
                 }
@@ -2756,6 +2811,7 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
 
         _ => {}
     }
+    made_changes
 }
 
 /// Find the next cell to the right that contains material
@@ -2788,10 +2844,11 @@ fn handle_mouse(
     right_clicked: bool,
     left_down: bool,
     _right_down: bool,
-) {
+) -> bool {
+    let mut made_changes = false;
     let (grid_x, grid_y) = match (editor.mouse_grid_x, editor.mouse_grid_y) {
         (Some(x), Some(y)) => (x, y),
-        _ => return,
+        _ => return false,
     };
 
     match editor.mode {
@@ -2807,12 +2864,15 @@ fn handle_mouse(
                     match editor.mode {
                         EditMode::NSilicon => {
                             place_silicon_path(circuit, &editor.current_path, SiliconKind::N);
+                            made_changes = true;
                         }
                         EditMode::PSilicon => {
                             place_silicon_path(circuit, &editor.current_path, SiliconKind::P);
+                            made_changes = true;
                         }
                         EditMode::Metal => {
                             place_metal_path(circuit, &editor.current_path);
+                            made_changes = true;
                         }
                         _ => {}
                     }
@@ -2831,9 +2891,11 @@ fn handle_mouse(
             // Use debounced clicks for via placement
             if left_clicked {
                 place_via(circuit, grid_x, grid_y);
+                made_changes = true;
             }
             if right_clicked {
                 delete_via(circuit, grid_x, grid_y);
+                made_changes = true;
             }
         }
 
@@ -2841,6 +2903,7 @@ fn handle_mouse(
             // Use held state for continuous deletion
             if left_down || right_clicked {
                 delete_metal(circuit, grid_x, grid_y);
+                made_changes = true;
             }
         }
 
@@ -2848,6 +2911,7 @@ fn handle_mouse(
             // Use held state for continuous deletion
             if left_down || right_clicked {
                 delete_silicon(circuit, grid_x, grid_y);
+                made_changes = true;
             }
         }
 
@@ -2855,6 +2919,7 @@ fn handle_mouse(
             // Use held state for continuous deletion
             if left_down || right_clicked {
                 delete_all(circuit, grid_x, grid_y);
+                made_changes = true;
             }
         }
 
@@ -2889,10 +2954,12 @@ fn handle_mouse(
 
                 if let Some(snippet) = snippet_to_paste {
                     paste_snippet(circuit, &snippet, editor.cursor_x, editor.cursor_y);
+                    made_changes = true;
                 }
             }
         }
     }
+    made_changes
 }
 
 /// Play the specified music track on the given sink (looping)
