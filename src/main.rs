@@ -1,8 +1,9 @@
 use minifb::{Key, Window, WindowOptions};
-use serde::Deserialize;
+use rodio::{Decoder, OutputStream, Sink, Source};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -25,7 +26,7 @@ const BUTTON_MARGIN: usize = 4;
 // Bottom area for help text, tabs, and content panel
 const HELP_AREA_HEIGHT: usize = 20;
 const TAB_HEIGHT: usize = 24;
-const TAB_CONTENT_HEIGHT: usize = 200;  // Content area below tabs
+const TAB_CONTENT_HEIGHT: usize = 230;  // Content area below tabs (increased for specs)
 const BOTTOM_AREA_HEIGHT: usize = HELP_AREA_HEIGHT + TAB_HEIGHT + TAB_CONTENT_HEIGHT;
 
 // Window size includes grid + panel + bottom area
@@ -131,6 +132,53 @@ enum Tab {
     Menu,
 }
 
+/// Music track selection
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MusicTrack {
+    None,
+    AnalogSequence,
+    GroovyBeat,
+    RetroLoop,
+}
+
+impl MusicTrack {
+    fn filename(&self) -> Option<&'static str> {
+        match self {
+            MusicTrack::None => None,
+            MusicTrack::AnalogSequence => Some("music/analog_sequence.wav"),
+            MusicTrack::GroovyBeat => Some("music/groovy_beat.wav"),
+            MusicTrack::RetroLoop => Some("music/retro_loop.wav"),
+        }
+    }
+
+    fn display_name(&self) -> &'static str {
+        match self {
+            MusicTrack::None => "No Music",
+            MusicTrack::AnalogSequence => "Analog Sequence",
+            MusicTrack::GroovyBeat => "Groovy Beat",
+            MusicTrack::RetroLoop => "Retro Loop",
+        }
+    }
+
+    fn next(&self) -> MusicTrack {
+        match self {
+            MusicTrack::None => MusicTrack::AnalogSequence,
+            MusicTrack::AnalogSequence => MusicTrack::GroovyBeat,
+            MusicTrack::GroovyBeat => MusicTrack::RetroLoop,
+            MusicTrack::RetroLoop => MusicTrack::RetroLoop, // Stay at end
+        }
+    }
+
+    fn prev(&self) -> MusicTrack {
+        match self {
+            MusicTrack::None => MusicTrack::None, // Stay at beginning
+            MusicTrack::AnalogSequence => MusicTrack::None,
+            MusicTrack::GroovyBeat => MusicTrack::AnalogSequence,
+            MusicTrack::RetroLoop => MusicTrack::GroovyBeat,
+        }
+    }
+}
+
 /// Dialog state for text input
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DialogState {
@@ -192,14 +240,24 @@ struct EditorState {
     // Levels (verification challenges)
     levels: Vec<Level>,
     selected_level: usize,
+    level_scroll_offset: usize,
     levels_dir: PathBuf,
+
+    // Save data (completion tracking, achievements)
+    save_data: SaveData,
+    save_path: PathBuf,
 
     // Yank buffer for paste operations
     yank_buffer: Option<Snippet>,
+
+    // Music selection
+    current_music: MusicTrack,
+    music_changed: bool, // Flag to signal main loop to update music playback
 }
 
 impl EditorState {
-    fn new(snippets_dir: PathBuf, designs_dir: PathBuf, levels_dir: PathBuf) -> Self {
+    fn new(snippets_dir: PathBuf, designs_dir: PathBuf, levels_dir: PathBuf, save_path: PathBuf) -> Self {
+        let save_data = SaveData::load(&save_path);
         Self {
             mode: EditMode::Visual,  // Start in visual mode
             visual_state: VisualState::Normal,
@@ -222,8 +280,13 @@ impl EditorState {
             designs_dir,
             levels: Vec::new(),
             selected_level: 0,
+            level_scroll_offset: 0,
             levels_dir,
+            save_data,
+            save_path,
             yank_buffer: None,
+            current_music: MusicTrack::None,
+            music_changed: false,
         }
     }
 
@@ -262,6 +325,32 @@ impl Pin {
             y,
         }
     }
+
+    /// Check if a grid coordinate is within this pin's 3x3 area
+    fn contains(&self, x: usize, y: usize) -> bool {
+        x >= self.x && x < self.x + PIN_SIZE && y >= self.y && y < self.y + PIN_SIZE
+    }
+}
+
+/// Check if a grid coordinate is within any pin's 3x3 area
+fn is_pin_cell(x: usize, y: usize, pins: &[Pin]) -> bool {
+    pins.iter().any(|pin| pin.contains(x, y))
+}
+
+/// Get corner fill flags for a pin cell based on diagonal neighbors
+/// Returns [top_left, top_right, bottom_left, bottom_right]
+/// A corner should be filled if the diagonal neighbor is also a pin cell
+fn get_pin_corner_fills(x: usize, y: usize, pins: &[Pin]) -> [bool; 4] {
+    [
+        // Top-left: check (x-1, y-1)
+        x > 0 && y > 0 && is_pin_cell(x - 1, y - 1, pins),
+        // Top-right: check (x+1, y-1)
+        y > 0 && is_pin_cell(x + 1, y - 1, pins),
+        // Bottom-left: check (x-1, y+1)
+        x > 0 && is_pin_cell(x - 1, y + 1, pins),
+        // Bottom-right: check (x+1, y+1)
+        is_pin_cell(x + 1, y + 1, pins),
+    ]
 }
 
 /// A waveform is a sequence of 0/1 values over discrete time steps
@@ -270,6 +359,8 @@ struct Waveform {
     pin_index: usize,      // Which pin (0-11)
     is_input: bool,        // true = input to circuit, false = expected output
     values: String,        // Signal values as string of '0' and '1' chars
+    #[serde(default)]
+    test: String,          // Test mask: '?' = check, 'x' = don't care (empty = check all)
     #[serde(default = "default_true")]
     display: bool,         // Whether to show in verification tab (default: true)
 }
@@ -280,8 +371,18 @@ fn default_true() -> bool { true }
 #[derive(Clone, Debug, Deserialize)]
 struct Level {
     name: String,
+    #[serde(default)]
+    order: usize,                 // For sorting levels in menu
     pins: Vec<String>,            // Labels for all 12 pins
     waveforms: Vec<Waveform>,     // Input and expected output waveforms
+    #[serde(default)]
+    specification: Vec<String>,   // Lines of text explaining the level
+    #[serde(default = "default_accuracy_threshold")]
+    accuracy_threshold: f32,      // Required accuracy to pass (0.97-0.98 typically)
+}
+
+fn default_accuracy_threshold() -> f32 {
+    0.98
 }
 
 impl Level {
@@ -289,6 +390,40 @@ impl Level {
     fn load(path: &Path) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&content).ok()
+    }
+}
+
+/// Save data for tracking progress
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SaveData {
+    completed_levels: Vec<String>,  // Names of completed levels
+    #[serde(default)]
+    achievements: Vec<String>,      // For future use
+}
+
+impl SaveData {
+    fn load(path: &Path) -> Self {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    fn save(&self, path: &Path) {
+        if let Ok(content) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, content);
+        }
+    }
+
+    fn is_level_complete(&self, level_name: &str) -> bool {
+        self.completed_levels.contains(&level_name.to_string())
+    }
+
+    fn mark_level_complete(&mut self, level_name: &str) {
+        if !self.is_level_complete(level_name) {
+            self.completed_levels.push(level_name.to_string());
+        }
     }
 }
 
@@ -305,8 +440,8 @@ fn load_all_levels(dir: &Path) -> Vec<Level> {
             }
         }
     }
-    // Sort by name
-    levels.sort_by(|a, b| a.name.cmp(&b.name));
+    // Sort by order (from filename prefix)
+    levels.sort_by_key(|l| l.order);
     levels
 }
 
@@ -464,6 +599,9 @@ struct SimState {
     gate_open: [[bool; GRID_WIDTH]; GRID_HEIGHT],  // From previous tick
     tick: usize,
     output_history: Vec<[bool; 12]>,  // History of output pin values for each tick
+    // Last simulation result
+    last_accuracy: Option<f32>,
+    last_passed: Option<bool>,
 }
 
 impl SimState {
@@ -475,6 +613,25 @@ impl SimState {
             gate_open: [[false; GRID_WIDTH]; GRID_HEIGHT],
             tick: 0,
             output_history: Vec::new(),
+            last_accuracy: None,
+            last_passed: None,
+        }
+    }
+
+    /// Initialize gate states based on circuit topology
+    /// P-channel gates start open (they conduct when gate signal is LOW)
+    /// N-channel gates start closed (they conduct when gate signal is HIGH)
+    fn init_gates(&mut self, circuit: &Circuit) {
+        for y in 0..GRID_HEIGHT {
+            for x in 0..GRID_WIDTH {
+                if let Some(node) = circuit.get_node(x, y) {
+                    if let Silicon::Gate { channel } = node.silicon {
+                        // P-channel gates are open when gate signal is LOW (initial state)
+                        // N-channel gates are closed when gate signal is LOW (initial state)
+                        self.gate_open[y][x] = matches!(channel, SiliconKind::P);
+                    }
+                }
+            }
         }
     }
 
@@ -1556,10 +1713,11 @@ fn main() {
     } else {
         PathBuf::from("levels")
     };
+    let save_path = PathBuf::from(".save.json");
 
     let mut buffer: Vec<u32> = vec![0; WINDOW_WIDTH * WINDOW_HEIGHT];
     let mut circuit = Circuit::new();
-    let mut editor = EditorState::new(snippets_dir.clone(), designs_dir.clone(), levels_dir.clone());
+    let mut editor = EditorState::new(snippets_dir.clone(), designs_dir.clone(), levels_dir.clone(), save_path);
 
     // Load existing snippets, designs, and levels from disk
     editor.snippets = load_all_snippets(&snippets_dir);
@@ -1575,6 +1733,11 @@ fn main() {
 
     // Add some test patterns to visualize
     setup_test_pattern(&mut circuit);
+
+    // Audio setup for music playback
+    let (_stream, stream_handle) = OutputStream::try_default()
+        .expect("Failed to create audio output stream");
+    let sink = Sink::try_new(&stream_handle).expect("Failed to create audio sink");
 
     // Simulation state
     let mut sim = SimState::new();
@@ -1664,7 +1827,13 @@ fn main() {
         }
 
         // Handle input
-        handle_input(&mut circuit, &mut editor, &new_keys, &window, &pins);
+        handle_input(&mut circuit, &mut editor, &mut sim, &new_keys, &window, &pins);
+
+        // Check if music selection changed via keyboard
+        if editor.music_changed {
+            play_music(editor.current_music, &sink);
+            editor.music_changed = false;
+        }
 
         // Get current mouse button states
         let left_down = window.get_mouse_down(minifb::MouseButton::Left);
@@ -1696,6 +1865,16 @@ fn main() {
             if left_clicked && my >= GRID_PIXEL_HEIGHT {
                 if let Some(tab) = get_clicked_tab(mx, my) {
                     editor.active_tab = tab;
+                }
+            }
+
+            // Check for music button clicks in Menu tab
+            if left_clicked && editor.active_tab == Tab::Menu {
+                if let Some(track) = get_clicked_music_button(mx, my) {
+                    if track != editor.current_music {
+                        editor.current_music = track;
+                        play_music(track, &sink);
+                    }
                 }
             }
 
@@ -1737,6 +1916,7 @@ fn main() {
             if sim_running {
                 // Reset simulation state when starting
                 sim = SimState::new();
+                sim.init_gates(&circuit);
                 sim_waveform_index = 0;
                 sim_last_tick = now;
             }
@@ -1771,6 +1951,48 @@ fn main() {
                     sim_waveform_index += 1;
                     if sim_waveform_index >= max_len {
                         sim_running = false; // Stop at end
+
+                        // Calculate accuracy and check for completion
+                        // Test mask: 'x' = don't care, '?' or empty = check
+                        let mut total_bits = 0;
+                        let mut correct_bits = 0;
+                        for waveform in level.waveforms.iter().filter(|w| !w.is_input) {
+                            let pin_idx = waveform.pin_index;
+                            let test_chars: Vec<char> = waveform.test.chars().collect();
+                            for (t, expected_ch) in waveform.values.chars().enumerate() {
+                                if t < sim.output_history.len() {
+                                    // Check test mask - skip if 'x', check if '?' or no mask
+                                    let should_check = if t < test_chars.len() {
+                                        test_chars[t] != 'x'
+                                    } else {
+                                        true  // No mask = check all
+                                    };
+                                    if !should_check {
+                                        continue;
+                                    }
+                                    total_bits += 1;
+                                    let expected = expected_ch == '1';
+                                    let actual = sim.output_history[t][pin_idx];
+                                    if expected == actual {
+                                        correct_bits += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        if total_bits > 0 {
+                            let accuracy = correct_bits as f32 / total_bits as f32;
+                            let passed = accuracy >= level.accuracy_threshold;
+
+                            // Store result for display
+                            sim.last_accuracy = Some(accuracy);
+                            sim.last_passed = Some(passed);
+
+                            if passed && !editor.save_data.is_level_complete(&level.name) {
+                                editor.save_data.mark_level_complete(&level.name);
+                                editor.save_data.save(&editor.save_path);
+                            }
+                        }
                     }
                 }
             }
@@ -1863,7 +2085,7 @@ fn next_tab(tab: Tab) -> Tab {
 }
 
 /// Handle keyboard input
-fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, new_keys: &[Key], window: &Window, pins: &[Pin]) {
+fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimState, new_keys: &[Key], window: &Window, pins: &[Pin]) {
     // Check if modifier keys are held
     let shift_held = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
     let ctrl_held = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
@@ -1951,14 +2173,31 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, new_keys: &[Key
                     editor.active_tab = next_tab(editor.active_tab);
                     continue;
                 }
-                // Shift + up/down for within-tab navigation (snippet/design/level selection)
+                // Shift + up/down for within-tab navigation (snippet/design/level/music selection)
                 Key::Up | Key::K => {
                     if editor.active_tab == Tab::DesignSnippets && !editor.snippets.is_empty() {
                         editor.selected_snippet = editor.selected_snippet.saturating_sub(1);
                     } else if editor.active_tab == Tab::Designs && !editor.designs.is_empty() {
                         editor.selected_design = editor.selected_design.saturating_sub(1);
                     } else if editor.active_tab == Tab::Verification && !editor.levels.is_empty() {
+                        let prev_level = editor.selected_level;
                         editor.selected_level = editor.selected_level.saturating_sub(1);
+                        // Adjust scroll offset to keep selected level visible
+                        if editor.selected_level < editor.level_scroll_offset {
+                            editor.level_scroll_offset = editor.selected_level;
+                        }
+                        // Reset simulation state when level changes
+                        if editor.selected_level != prev_level {
+                            sim.output_history.clear();
+                            sim.last_accuracy = None;
+                            sim.last_passed = None;
+                        }
+                    } else if editor.active_tab == Tab::Menu {
+                        let new_track = editor.current_music.prev();
+                        if new_track != editor.current_music {
+                            editor.current_music = new_track;
+                            editor.music_changed = true;
+                        }
                     }
                     continue;
                 }
@@ -1968,7 +2207,24 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, new_keys: &[Key
                     } else if editor.active_tab == Tab::Designs && !editor.designs.is_empty() {
                         editor.selected_design = (editor.selected_design + 1).min(editor.designs.len() - 1);
                     } else if editor.active_tab == Tab::Verification && !editor.levels.is_empty() {
+                        let prev_level = editor.selected_level;
                         editor.selected_level = (editor.selected_level + 1).min(editor.levels.len() - 1);
+                        // Adjust scroll offset to keep selected level visible (max 10 visible)
+                        if editor.selected_level >= editor.level_scroll_offset + 10 {
+                            editor.level_scroll_offset = editor.selected_level - 9;
+                        }
+                        // Reset simulation state when level changes
+                        if editor.selected_level != prev_level {
+                            sim.output_history.clear();
+                            sim.last_accuracy = None;
+                            sim.last_passed = None;
+                        }
+                    } else if editor.active_tab == Tab::Menu {
+                        let new_track = editor.current_music.next();
+                        if new_track != editor.current_music {
+                            editor.current_music = new_track;
+                            editor.music_changed = true;
+                        }
                     }
                     continue;
                 }
@@ -2639,6 +2895,22 @@ fn handle_mouse(
     }
 }
 
+/// Play the specified music track on the given sink (looping)
+fn play_music(track: MusicTrack, sink: &Sink) {
+    // Stop any currently playing music
+    sink.stop();
+
+    if let Some(filename) = track.filename() {
+        if let Ok(file) = File::open(filename) {
+            let reader = BufReader::new(file);
+            if let Ok(source) = Decoder::new(reader) {
+                sink.append(source.repeat_infinite());
+                sink.play();
+            }
+        }
+    }
+}
+
 /// Load a BDF font file and return a map of character to bitmap data
 fn load_font(path: &str) -> HashMap<char, Vec<Vec<bool>>> {
     use std::fs;
@@ -2887,7 +3159,7 @@ fn render(circuit: &Circuit, editor: &EditorState, pins: &[Pin], font: &HashMap<
     // Draw all cells (pins are just cells with metal)
     for grid_y in 0..GRID_HEIGHT {
         for grid_x in 0..GRID_WIDTH {
-            render_cell(circuit, grid_x, grid_y, buffer);
+            render_cell(circuit, grid_x, grid_y, pins, buffer);
         }
     }
 
@@ -3160,7 +3432,7 @@ fn render_bottom_area(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>
 
     // Draw tabs
     let tabs = [
-        (Tab::Specifications, "Specs"),
+        (Tab::Specifications, "Data"),
         (Tab::Verification, "Verify"),
         (Tab::DesignSnippets, "Snippets"),
         (Tab::Designs, "Designs"),
@@ -3218,10 +3490,105 @@ fn render_bottom_area(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>
                 draw_text(line, 10, content_y + 15 + i * 16, font, COLOR_BUTTON_TEXT, buffer);
             }
         }
-        _ => {
-            // Placeholder for other tabs
-            draw_text("(Coming soon)", WINDOW_WIDTH / 2, content_y + TAB_CONTENT_HEIGHT / 2, font, COLOR_BUTTON_TEXT, buffer);
+        Tab::Menu => {
+            render_menu_tab(editor, content_y, font, buffer);
         }
+        Tab::Specifications => {
+            render_specifications_tab(editor, content_y, font, buffer);
+        }
+    }
+}
+
+/// Render the menu tab content with music selection
+fn render_menu_tab(editor: &EditorState, content_y: usize, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
+    // Title
+    draw_text_left("Music Selection", 10, content_y + 12, font, COLOR_BUTTON_TEXT, buffer);
+
+    // Music track buttons
+    let tracks = [
+        MusicTrack::None,
+        MusicTrack::AnalogSequence,
+        MusicTrack::GroovyBeat,
+        MusicTrack::RetroLoop,
+    ];
+
+    let btn_x = 10;
+    let btn_w = 180;
+    let btn_h = 28;
+    let btn_spacing = 6;
+
+    for (i, track) in tracks.iter().enumerate() {
+        let btn_y = content_y + 32 + i * (btn_h + btn_spacing);
+        let is_selected = editor.current_music == *track;
+
+        // Draw button background
+        for y in btn_y..btn_y + btn_h {
+            for x in btn_x..btn_x + btn_w {
+                if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                    let color = if y == btn_y || x == btn_x {
+                        COLOR_BUTTON_LIGHT
+                    } else if y == btn_y + btn_h - 1 || x == btn_x + btn_w - 1 {
+                        COLOR_BUTTON_DARK
+                    } else {
+                        COLOR_BUTTON_BG
+                    };
+                    buffer[y * WINDOW_WIDTH + x] = color;
+                }
+            }
+        }
+
+        // Draw selection indicator (green border)
+        if is_selected {
+            let border = 2;
+            for y in btn_y..btn_y + btn_h {
+                for x in btn_x..btn_x + btn_w {
+                    if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                        let on_border = x < btn_x + border || x >= btn_x + btn_w - border
+                            || y < btn_y + border || y >= btn_y + btn_h - border;
+                        if on_border {
+                            buffer[y * WINDOW_WIDTH + x] = 0x00aa00; // Green border for selected
+                        }
+                    }
+                }
+            }
+        }
+
+        // Draw track name
+        let text_y = btn_y + btn_h / 2;
+        draw_text_left(track.display_name(), btn_x + 10, text_y, font, COLOR_BUTTON_TEXT, buffer);
+    }
+
+    // Attribution text
+    let attr_x = btn_x + btn_w + 40;
+    draw_text_left("Music from Freesound.org:", attr_x, content_y + 40, font, 0x606060, buffer);
+    draw_text_left("Analog Sequence - Xinematix (CC BY 4.0)", attr_x, content_y + 60, font, 0x707070, buffer);
+    draw_text_left("Groovy Beat - Seth_Makes_Sounds (CC0)", attr_x, content_y + 78, font, 0x707070, buffer);
+    draw_text_left("Retro Loop - ProdByRey (CC0)", attr_x, content_y + 96, font, 0x707070, buffer);
+}
+
+/// Render the specifications tab content
+fn render_specifications_tab(editor: &EditorState, content_y: usize, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
+    // Get the currently selected level
+    if let Some(level) = editor.levels.get(editor.selected_level) {
+        // Check if level is completed for coloring
+        let completed = editor.save_data.is_level_complete(&level.name);
+
+        // Draw specification lines starting near the top
+        // The spec text itself contains the part number/header, so no separate title needed
+        let line_height = 14;
+        let start_y = content_y + 8;  // Start closer to top (was +32)
+
+        for (i, line) in level.specification.iter().enumerate() {
+            let y = start_y + i * line_height;
+            if y + line_height < WINDOW_HEIGHT {
+                // First line (part number) is green if completed
+                let color = if i == 0 && completed { 0x00aa00 } else { 0x404040 };
+                draw_text_left(line, 10, y, font, color, buffer);
+            }
+        }
+    } else {
+        draw_text_left("No level selected", 10, content_y + 20, font, 0x808080, buffer);
+        draw_text_left("Use Shift+Up/Down on Verify tab to select a level", 10, content_y + 40, font, 0x808080, buffer);
     }
 }
 
@@ -3383,13 +3750,23 @@ fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMa
         }
     }
 
-    // Draw level list
+    // Draw level list (max 10 visible with scrolling)
+    let max_visible = 10;
     if editor.levels.is_empty() {
         draw_text("No levels found", 10, content_y + 20, font, 0x808080, buffer);
-        draw_text("Add .lvl files to levels/", 10, content_y + 40, font, 0x808080, buffer);
+        draw_text("Add .json files to levels/", 10, content_y + 40, font, 0x808080, buffer);
     } else {
-        for (i, level) in editor.levels.iter().enumerate() {
-            let item_y = content_y + 8 + i * 18;
+        // Draw scroll indicator if needed
+        if editor.level_scroll_offset > 0 {
+            draw_text_left("^", list_width / 2, content_y + 2, font, 0x606060, buffer);
+        }
+
+        let visible_levels = editor.levels.iter().enumerate()
+            .skip(editor.level_scroll_offset)
+            .take(max_visible);
+
+        for (idx, (i, level)) in visible_levels.enumerate() {
+            let item_y = content_y + 8 + idx * 18;
             if item_y + 16 > WINDOW_HEIGHT {
                 break;
             }
@@ -3405,7 +3782,18 @@ fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMa
                 }
             }
 
-            draw_text(&level.name, 10, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+            // Completion indicator and color
+            let completed = editor.save_data.is_level_complete(&level.name);
+            let indicator = if completed { "*" } else { " " };
+            let display_name = format!("{} {}", indicator, level.name);
+            let text_color = if completed { 0x00aa00 } else { COLOR_BUTTON_TEXT };
+            draw_text(&display_name, 6, item_y + 6, font, text_color, buffer);
+        }
+
+        // Draw scroll indicator if more below
+        if editor.level_scroll_offset + max_visible < editor.levels.len() {
+            let bottom_y = content_y + 8 + max_visible * 18;
+            draw_text_left("v", list_width / 2, bottom_y, font, 0x606060, buffer);
         }
     }
 
@@ -3417,11 +3805,27 @@ fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMa
         // Draw waveforms
         let wave_start_y = content_y + 30;
         let wave_height = 12;
-        let time_step_width = 8;
-        let wave_x_start = waveform_x + 50;
+        let time_step_width = 3;  // Narrower ticks (was 5)
+        let wave_x_start = waveform_x + 40;
 
         // Only show waveforms with display: true
         let displayed_waveforms: Vec<_> = level.waveforms.iter().filter(|w| w.display).collect();
+
+        // Draw gray dashed vertical lines every 2 ticks
+        let max_ticks = level.waveforms.iter().map(|w| w.values.len()).max().unwrap_or(64);
+        let wave_area_height = displayed_waveforms.len() * (wave_height + 8);
+        for tick in (0..max_ticks).step_by(2) {
+            let x = wave_x_start + tick * time_step_width;
+            if x >= WINDOW_WIDTH {
+                break;
+            }
+            // Draw dashed line (every other pixel)
+            for y in wave_start_y..(wave_start_y + wave_area_height).min(WINDOW_HEIGHT) {
+                if (y % 4) < 2 {  // Dashed pattern: 2 on, 2 off
+                    buffer[y * WINDOW_WIDTH + x] = 0xc0c0c0;  // Light gray
+                }
+            }
+        }
 
         for (wi, waveform) in displayed_waveforms.iter().enumerate() {
             let y_base = wave_start_y + wi * (wave_height + 8);
@@ -3431,16 +3835,16 @@ fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMa
 
             // Label
             let pin_label = level.pins.get(waveform.pin_index).map(|s| s.as_str()).unwrap_or("?");
-            let direction = if waveform.is_input { "I" } else { "O" };
-            draw_text_left(&format!("{} {}", pin_label, direction), waveform_x, y_base + wave_height / 2, font, 0x404040, buffer);
+            draw_text_left(pin_label, waveform_x, y_base + wave_height / 2, font, 0x404040, buffer);
 
             // Draw expected waveform (inputs always blue, outputs gray when sim has output, otherwise green)
             let chars: Vec<char> = waveform.values.chars().collect();
             for (t, &ch) in chars.iter().enumerate() {
-                let value = ch == '1';
                 let x = wave_x_start + t * time_step_width;
                 let y_high = y_base;
                 let y_low = y_base + wave_height - 2;
+
+                let value = ch == '1';
                 let y = if value { y_high } else { y_low };
 
                 // Color: blue for inputs, gray for expected outputs when sim running, green otherwise
@@ -3460,10 +3864,13 @@ fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMa
                 }
 
                 // Draw vertical transition if needed
-                if t > 0 && (chars[t - 1] == '1') != value {
-                    for dy in y_high..=y_low {
-                        if x < WINDOW_WIDTH && dy < WINDOW_HEIGHT {
-                            buffer[dy * WINDOW_WIDTH + x] = color;
+                if t > 0 {
+                    let prev_value = chars[t - 1] == '1';
+                    if prev_value != value {
+                        for dy in y_high..=y_low {
+                            if x < WINDOW_WIDTH && dy < WINDOW_HEIGHT {
+                                buffer[dy * WINDOW_WIDTH + x] = color;
+                            }
                         }
                     }
                 }
@@ -3510,9 +3917,19 @@ fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMa
         }
     }
 
-    // Show simulation status
+    // Show simulation status or result
     if sim_running {
         draw_text_left("RUNNING (Space to stop)", waveform_x, content_y + 10, font, 0x008800, buffer);
+    } else if let (Some(accuracy), Some(passed)) = (sim.last_accuracy, sim.last_passed) {
+        // Show accuracy result
+        let pct = (accuracy * 100.0) as u32;
+        let result_text = if passed {
+            format!("{}% PASS", pct)
+        } else {
+            format!("{}% FAIL", pct)
+        };
+        let result_color = if passed { 0x00aa00 } else { 0xff0000 };
+        draw_text_left(&result_text, waveform_x, content_y + 10, font, result_color, buffer);
     } else {
         draw_text_left("Press Space to simulate", waveform_x, content_y + 10, font, 0x606060, buffer);
     }
@@ -3521,9 +3938,10 @@ fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMa
 /// Check which tab was clicked (if any)
 fn get_clicked_tab(mx: usize, my: usize) -> Option<Tab> {
     let tab_y = GRID_PIXEL_HEIGHT + HELP_AREA_HEIGHT;
+    let content_y = tab_y + TAB_HEIGHT;
 
-    // Check if y is in tab area
-    if my < tab_y || my >= WINDOW_HEIGHT {
+    // Check if y is in tab bar area (not the content area below)
+    if my < tab_y || my >= content_y {
         return None;
     }
 
@@ -3543,6 +3961,36 @@ fn get_clicked_tab(mx: usize, my: usize) -> Option<Tab> {
     } else {
         None
     }
+}
+
+/// Check which music button was clicked (if any) in the Menu tab
+fn get_clicked_music_button(mx: usize, my: usize) -> Option<MusicTrack> {
+    let content_y = GRID_PIXEL_HEIGHT + HELP_AREA_HEIGHT + TAB_HEIGHT;
+    let btn_x = 10;
+    let btn_w = 180;
+    let btn_h = 28;
+    let btn_spacing = 6;
+
+    // Check if x is within button bounds
+    if mx < btn_x || mx >= btn_x + btn_w {
+        return None;
+    }
+
+    let tracks = [
+        MusicTrack::None,
+        MusicTrack::AnalogSequence,
+        MusicTrack::GroovyBeat,
+        MusicTrack::RetroLoop,
+    ];
+
+    for (i, track) in tracks.iter().enumerate() {
+        let btn_y = content_y + 32 + i * (btn_h + btn_spacing);
+        if my >= btn_y && my < btn_y + btn_h {
+            return Some(*track);
+        }
+    }
+
+    None
 }
 
 /// Check which panel button was clicked (if any)
@@ -3919,7 +4367,7 @@ fn draw_text_left(
     }
 }
 
-fn render_cell(circuit: &Circuit, grid_x: usize, grid_y: usize, buffer: &mut [u32]) {
+fn render_cell(circuit: &Circuit, grid_x: usize, grid_y: usize, pins: &[Pin], buffer: &mut [u32]) {
     let x_start = grid_x * CELL_SIZE;
     let y_start = grid_y * CELL_SIZE;
 
@@ -3957,16 +4405,19 @@ fn render_cell(circuit: &Circuit, grid_x: usize, grid_y: usize, buffer: &mut [u3
         None => return,
     };
 
+    // No corner fills for silicon layers
+    let no_corner_fills = [false; 4];
+
     // Determine what to draw based on node's silicon type
     match node.silicon {
         Silicon::None => {}
         Silicon::N => {
             let conns = get_layer_connections(circuit, grid_x, grid_y, Layer::NSilicon);
-            draw_layer(buffer, x_start, y_start, &conns, COLOR_N_TYPE);
+            draw_layer(buffer, x_start, y_start, &conns, COLOR_N_TYPE, no_corner_fills);
         }
         Silicon::P => {
             let conns = get_layer_connections(circuit, grid_x, grid_y, Layer::PSilicon);
-            draw_layer(buffer, x_start, y_start, &conns, COLOR_P_TYPE);
+            draw_layer(buffer, x_start, y_start, &conns, COLOR_P_TYPE, no_corner_fills);
         }
         Silicon::Gate { channel } => {
             // Draw channel first (spans full connection), then gate on top (narrower, darker)
@@ -3977,7 +4428,7 @@ fn render_cell(circuit: &Circuit, grid_x: usize, grid_y: usize, buffer: &mut [u3
             let channel_conns = get_layer_connections(circuit, grid_x, grid_y, channel_layer);
             let gate_conns = get_layer_connections(circuit, grid_x, grid_y, gate_layer);
             // Channel draws as normal wire
-            draw_layer(buffer, x_start, y_start, &channel_conns, channel_color);
+            draw_layer(buffer, x_start, y_start, &channel_conns, channel_color, no_corner_fills);
             // Gate draws narrower
             draw_gate_layer(buffer, x_start, y_start, &gate_conns, gate_color);
         }
@@ -3991,7 +4442,13 @@ fn render_cell(circuit: &Circuit, grid_x: usize, grid_y: usize, buffer: &mut [u3
     // Draw metal layer on top with alpha blending
     if node.metal {
         let conns = get_layer_connections(circuit, grid_x, grid_y, Layer::Metal);
-        draw_layer_alpha(buffer, x_start, y_start, &conns, COLOR_METAL, METAL_ALPHA);
+        // For pin cells, fill corners where diagonal neighbors are also pin cells
+        let corner_fills = if is_pin_cell(grid_x, grid_y, pins) {
+            get_pin_corner_fills(grid_x, grid_y, pins)
+        } else {
+            no_corner_fills
+        };
+        draw_layer_alpha(buffer, x_start, y_start, &conns, COLOR_METAL, METAL_ALPHA, corner_fills);
     }
 }
 
@@ -4150,7 +4607,8 @@ const F: u8 = 1; // Fill
 const O: u8 = 2; // Outline
 
 /// Get the tile for a given connection pattern
-fn get_tile(up: bool, down: bool, left: bool, right: bool) -> [[u8; CELL_SIZE]; CELL_SIZE] {
+/// corner_fills: [top_left, top_right, bottom_left, bottom_right] - fill corners for pin cells
+fn get_tile(up: bool, down: bool, left: bool, right: bool, corner_fills: [bool; 4]) -> [[u8; CELL_SIZE]; CELL_SIZE] {
     let mut tile = [[E; CELL_SIZE]; CELL_SIZE];
 
     // Wire occupies most of the cell (leaving small margin, proportional to cell size)
@@ -4161,6 +4619,8 @@ fn get_tile(up: bool, down: bool, left: bool, right: bool) -> [[u8; CELL_SIZE]; 
     let corner_radius = CELL_SIZE / 10;
     let corner_radius = if corner_radius < 1 { 1 } else { corner_radius };
 
+    let [fill_tl, fill_tr, fill_bl, fill_br] = corner_fills;
+
     // Helper to check if a position is in the wire region (before corner rounding)
     let in_center_rect = |x: usize, y: usize| {
         x >= wire_start && x < wire_end && y >= wire_start && y < wire_end
@@ -4170,39 +4630,47 @@ fn get_tile(up: bool, down: bool, left: bool, right: bool) -> [[u8; CELL_SIZE]; 
     let in_left_arm = |x: usize, y: usize| left && y >= wire_start && y < wire_end && x < wire_start;
     let in_right_arm = |x: usize, y: usize| right && y >= wire_start && y < wire_end && x >= wire_end;
 
+    // Corner fill regions (for pin cells where diagonal neighbor is also a pin cell)
+    let in_corner_fill = |x: usize, y: usize| {
+        (fill_tl && x < wire_start && y < wire_start) ||
+        (fill_tr && x >= wire_end && y < wire_start) ||
+        (fill_bl && x < wire_start && y >= wire_end) ||
+        (fill_br && x >= wire_end && y >= wire_end)
+    };
+
     let in_rect_shape = |x: usize, y: usize| {
-        in_center_rect(x, y) || in_up_arm(x, y) || in_down_arm(x, y) || in_left_arm(x, y) || in_right_arm(x, y)
+        in_center_rect(x, y) || in_up_arm(x, y) || in_down_arm(x, y) || in_left_arm(x, y) || in_right_arm(x, y) || in_corner_fill(x, y)
     };
 
     // Check if a point should be cut off for corner rounding
-    // Only round corners of the center square where there's no connection
+    // Only round corners of the center square where there's no connection AND no corner fill
     let in_rounded_corner = |x: usize, y: usize| -> bool {
-        // Top-left of center (only if no up and no left connection)
-        if !up && !left && x < wire_start + corner_radius && y < wire_start + corner_radius {
+        // Top-left of center (only if no up and no left connection and not filled)
+        if !up && !left && !fill_tl && x < wire_start + corner_radius && y < wire_start + corner_radius {
             let dx = (wire_start + corner_radius - 1) as isize - x as isize;
             let dy = (wire_start + corner_radius - 1) as isize - y as isize;
             if dx + dy >= corner_radius as isize {
                 return true;
             }
         }
-        // Top-right of center (only if no up and no right connection)
-        if !up && !right && x >= wire_end - corner_radius && y < wire_start + corner_radius {
+        // Top-right of center (only if no up and no right connection and not filled)
+        if !up && !right && !fill_tr && x >= wire_end - corner_radius && y < wire_start + corner_radius {
             let dx = x as isize - (wire_end - corner_radius) as isize;
             let dy = (wire_start + corner_radius - 1) as isize - y as isize;
             if dx + dy >= corner_radius as isize {
                 return true;
             }
         }
-        // Bottom-left of center (only if no down and no left connection)
-        if !down && !left && x < wire_start + corner_radius && y >= wire_end - corner_radius {
+        // Bottom-left of center (only if no down and no left connection and not filled)
+        if !down && !left && !fill_bl && x < wire_start + corner_radius && y >= wire_end - corner_radius {
             let dx = (wire_start + corner_radius - 1) as isize - x as isize;
             let dy = y as isize - (wire_end - corner_radius) as isize;
             if dx + dy >= corner_radius as isize {
                 return true;
             }
         }
-        // Bottom-right of center (only if no down and no right connection)
-        if !down && !right && x >= wire_end - corner_radius && y >= wire_end - corner_radius {
+        // Bottom-right of center (only if no down and no right connection and not filled)
+        if !down && !right && !fill_br && x >= wire_end - corner_radius && y >= wire_end - corner_radius {
             let dx = x as isize - (wire_end - corner_radius) as isize;
             let dy = y as isize - (wire_end - corner_radius) as isize;
             if dx + dy >= corner_radius as isize {
@@ -4258,9 +4726,10 @@ fn draw_layer(
     cell_y: usize,
     conns: &[bool; 4], // [up, down, left, right]
     color: u32,
+    corner_fills: [bool; 4], // [top_left, top_right, bottom_left, bottom_right]
 ) {
     let [conn_up, conn_down, conn_left, conn_right] = conns;
-    let tile = get_tile(*conn_up, *conn_down, *conn_left, *conn_right);
+    let tile = get_tile(*conn_up, *conn_down, *conn_left, *conn_right, corner_fills);
 
     // Determine start positions - extend into grid line area when connected
     let start_x = if *conn_left { 0 } else { 1 };
@@ -4450,9 +4919,10 @@ fn draw_layer_alpha(
     conns: &[bool; 4],
     color: u32,
     alpha: f32,
+    corner_fills: [bool; 4], // [top_left, top_right, bottom_left, bottom_right]
 ) {
     let [conn_up, conn_down, conn_left, conn_right] = conns;
-    let tile = get_tile(*conn_up, *conn_down, *conn_left, *conn_right);
+    let tile = get_tile(*conn_up, *conn_down, *conn_left, *conn_right, corner_fills);
 
     let start_x = if *conn_left { 0 } else { 1 };
     let start_y = if *conn_up { 0 } else { 1 };
