@@ -205,9 +205,9 @@ enum OscWaveform {
 impl OscWaveform {
     fn display_name(&self) -> &'static str {
         match self {
-            OscWaveform::Saw => "ПИЛА",      // Saw (Russian)
-            OscWaveform::Square => "ПРЯМОУГ", // Square/Rectangle
-            OscWaveform::Triangle => "ТРЕУГ",  // Triangle
+            OscWaveform::Saw => "САЩ",       // SAW
+            OscWaveform::Square => "СКВЕР",   // SQUARE
+            OscWaveform::Triangle => "ТРИАНГ", // TRIANGLE
         }
     }
 
@@ -235,7 +235,7 @@ impl MusicalMode {
             MusicalMode::Major => "МАЖОР",
             MusicalMode::Minor => "МИНОР",
             MusicalMode::Dorian => "ДОРИАН",
-            MusicalMode::Mixolydian => "МИКСОЛ",
+            MusicalMode::Mixolydian => "МИКСО",
         }
     }
 
@@ -275,6 +275,7 @@ struct SynthParams {
     volume: f32,           // 0-1
     mode: MusicalMode,
     chord_trigger: bool,   // Set true to trigger new chord envelope
+    sfx_queue: Vec<SoundEffect>,  // Queued sound effects to play
 }
 
 impl Default for SynthParams {
@@ -294,6 +295,7 @@ impl Default for SynthParams {
             volume: 0.5,
             mode: MusicalMode::Major,
             chord_trigger: false,
+            sfx_queue: Vec::new(),
         }
     }
 }
@@ -312,6 +314,18 @@ enum SynthControl {
     Attack,
     Release,
     Volume,
+}
+
+/// Sound effects for UI feedback (8-bit style)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoundEffect {
+    ButtonClick,  // 900→600 Hz sweep + noise, ~40ms
+    TabSwitch,    // Two-note arpeggio 440→660 Hz, ~60ms
+    Place,        // High pip 2400→1800 Hz triangle, ~25ms
+    Delete,       // Descending sweep 300→50 Hz, ~120ms
+    Blocked,      // Two detuned low squares 110/117 Hz, ~80ms
+    VerifySuccess, // Ascending triumphant arpeggio
+    VerifyFail,    // Descending sad buzzer
 }
 
 /// Dialog state for text input
@@ -365,11 +379,13 @@ struct EditorState {
     // Snippets
     snippets: Vec<Snippet>,
     selected_snippet: usize,
+    snippet_scroll_offset: usize,
     snippets_dir: PathBuf,
 
     // Designs (full circuit saves)
     designs: Vec<Snippet>,  // Reuse Snippet struct for full designs
     selected_design: usize,
+    design_scroll_offset: usize,
     designs_dir: PathBuf,
 
     // Levels (verification challenges)
@@ -409,9 +425,11 @@ impl EditorState {
             mouse_grid_y: None,
             snippets: Vec::new(),
             selected_snippet: 0,
+            snippet_scroll_offset: 0,
             snippets_dir,
             designs: Vec::new(),
             selected_design: 0,
+            design_scroll_offset: 0,
             designs_dir,
             levels: Vec::new(),
             selected_level: 0,
@@ -1369,22 +1387,47 @@ fn validate_gate(circuit: &mut Circuit, x: usize, y: usize) {
     };
 
     // Check if the channel still has through connections (both ends)
-    let layer = match channel {
+    let channel_layer = match channel {
         SiliconKind::N => Layer::NSilicon,
         SiliconKind::P => Layer::PSilicon,
     };
 
-    let conn_left = circuit.is_connected(x, y, Direction::Left, layer);
-    let conn_right = circuit.is_connected(x, y, Direction::Right, layer);
-    let conn_up = circuit.is_connected(x, y, Direction::Up, layer);
-    let conn_down = circuit.is_connected(x, y, Direction::Down, layer);
+    // The gate control is the opposite silicon type
+    let gate_layer = match channel {
+        SiliconKind::N => Layer::PSilicon,
+        SiliconKind::P => Layer::NSilicon,
+    };
 
-    let horizontal_through = conn_left && conn_right;
-    let vertical_through = conn_up && conn_down;
+    let ch_left = circuit.is_connected(x, y, Direction::Left, channel_layer);
+    let ch_right = circuit.is_connected(x, y, Direction::Right, channel_layer);
+    let ch_up = circuit.is_connected(x, y, Direction::Up, channel_layer);
+    let ch_down = circuit.is_connected(x, y, Direction::Down, channel_layer);
 
-    // Gate is valid if channel has through connection in exactly one axis
-    let is_valid = (horizontal_through && !conn_up && !conn_down)
-        || (vertical_through && !conn_left && !conn_right);
+    let gate_left = circuit.is_connected(x, y, Direction::Left, gate_layer);
+    let gate_right = circuit.is_connected(x, y, Direction::Right, gate_layer);
+    let gate_up = circuit.is_connected(x, y, Direction::Up, gate_layer);
+    let gate_down = circuit.is_connected(x, y, Direction::Down, gate_layer);
+
+    let ch_horizontal = ch_left && ch_right;
+    let ch_vertical = ch_up && ch_down;
+
+    // Gate control must be perpendicular to channel and have at least one connection
+    let gate_has_control = if ch_horizontal {
+        // Channel is horizontal, gate control must be vertical
+        gate_up || gate_down
+    } else if ch_vertical {
+        // Channel is vertical, gate control must be horizontal
+        gate_left || gate_right
+    } else {
+        false
+    };
+
+    // Gate is valid if:
+    // 1. Channel has through connection in exactly one axis
+    // 2. Gate control silicon exists in the perpendicular direction
+    let channel_valid = (ch_horizontal && !ch_up && !ch_down)
+        || (ch_vertical && !ch_left && !ch_right);
+    let is_valid = channel_valid && gate_has_control;
 
     if !is_valid {
         // Convert gate back to channel type
@@ -1963,7 +2006,7 @@ fn main() {
         }
 
         // Handle input
-        handle_input(&mut circuit, &mut editor, &mut sim, &mut sim_running, &mut sim_paused, &new_keys, &window, &pins);
+        handle_input(&mut circuit, &mut editor, &mut sim, &mut sim_running, &mut sim_paused, &new_keys, &window, &pins, &synth_params);
 
         // Update synth sequencer timing
         {
@@ -2004,13 +2047,17 @@ fn main() {
                         editor.visual_state = VisualState::Normal;
                         editor.selection_anchor = None;
                     }
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::ButtonClick);
                 }
             }
 
             // Check for tab clicks
             if left_clicked && my >= GRID_PIXEL_HEIGHT {
                 if let Some(tab) = get_clicked_tab(mx, my) {
-                    editor.active_tab = tab;
+                    if editor.active_tab != tab {
+                        editor.active_tab = tab;
+                        synth_params.lock().unwrap().sfx_queue.push(SoundEffect::TabSwitch);
+                    }
                 }
             }
 
@@ -2049,7 +2096,7 @@ fn main() {
         }
 
         // Handle mouse clicks with debouncing (only for grid area)
-        let mouse_made_changes = handle_mouse(&mut circuit, &mut editor, left_clicked, right_clicked, left_down, right_down);
+        let mouse_made_changes = handle_mouse(&mut circuit, &mut editor, left_clicked, right_clicked, left_down, right_down, &synth_params);
         if mouse_made_changes && sim_running {
             sim_running = false;
             sim_paused = false;
@@ -2147,6 +2194,10 @@ fn main() {
                             sim.last_accuracy = Some(accuracy);
                             sim.last_passed = Some(passed);
 
+                            // Play success/fail sound
+                            let sfx = if passed { SoundEffect::VerifySuccess } else { SoundEffect::VerifyFail };
+                            synth_params.lock().unwrap().sfx_queue.push(sfx);
+
                             if passed && !editor.save_data.is_level_complete(&level.name) {
                                 editor.save_data.mark_level_complete(&level.name);
                                 editor.save_data.save(&editor.save_path);
@@ -2158,8 +2209,10 @@ fn main() {
         }
 
         // Render
+        let shift_held = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+        let tab_held = window.is_key_down(Key::Tab);
         let params_snapshot = synth_params.lock().unwrap().clone();
-        render(&circuit, &editor, &params_snapshot, &pins, &font, &sim, sim_running, sim_waveform_index, &mut buffer);
+        render(&circuit, &editor, &params_snapshot, &pins, &font, &sim, sim_running, sim_waveform_index, shift_held, tab_held, &mut buffer);
 
         window
             .update_with_buffer(&buffer, WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -2220,6 +2273,106 @@ fn key_to_char(key: Key, shift: bool) -> Option<char> {
     }
 }
 
+/// Transliterate a Latin string to pig-russian Cyrillic for display
+/// Single letters: a→а, b→б, c→к, d→д, e→е, f→ф, g→г, h→х, i→и, j→ж, k→к, l→л,
+/// m→м, n→н, o→о, p→п, q→к, r→р, s→с, t→т, u→у, v→в, w→щ, x→кс, y→ы, z→з
+/// Word-start bigrams: th→ѳ, sh→щ, ch→х, sch→щ
+/// Word-end trigram: ing→инг
+fn transliterate_to_cyrillic(input: &str) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let c = chars[i];
+        let c_lower = c.to_ascii_lowercase();
+        let is_upper = c.is_ascii_uppercase();
+
+        // Check if we're at word start (beginning or after non-letter)
+        let at_word_start = i == 0 || !chars[i - 1].is_ascii_alphabetic();
+
+        // Check if position is at word end (followed by non-letter or end)
+        let is_word_end = |pos: usize| pos == len || !chars[pos].is_ascii_alphabetic();
+
+        // Word-start trigram: sch→щ
+        if at_word_start && i + 3 <= len {
+            let tri: String = chars[i..i+3].iter().collect::<String>().to_lowercase();
+            if tri == "sch" {
+                result.push(if is_upper { 'Щ' } else { 'щ' });
+                i += 3;
+                continue;
+            }
+        }
+
+        // Word-end trigram: ing→инг
+        if i + 3 <= len && is_word_end(i + 3) {
+            let tri: String = chars[i..i+3].iter().collect::<String>().to_lowercase();
+            if tri == "ing" {
+                result.push_str(if is_upper { "ИНГ" } else { "инг" });
+                i += 3;
+                continue;
+            }
+        }
+
+        // Word-start bigrams: th→ѳ, sh→щ, ch→х
+        if at_word_start && i + 2 <= len {
+            let bi: String = chars[i..i+2].iter().collect::<String>().to_lowercase();
+            match bi.as_str() {
+                "th" => {
+                    result.push(if is_upper { 'Ѳ' } else { 'ѳ' });
+                    i += 2;
+                    continue;
+                }
+                "sh" => {
+                    result.push(if is_upper { 'Щ' } else { 'щ' });
+                    i += 2;
+                    continue;
+                }
+                "ch" => {
+                    result.push(if is_upper { 'Х' } else { 'х' });
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Single character transliteration
+        match c_lower {
+            'a' => result.push(if is_upper { 'А' } else { 'а' }),
+            'b' => result.push(if is_upper { 'Б' } else { 'б' }),
+            'c' => result.push(if is_upper { 'К' } else { 'к' }),
+            'd' => result.push(if is_upper { 'Д' } else { 'д' }),
+            'e' => result.push(if is_upper { 'Е' } else { 'е' }),
+            'f' => result.push(if is_upper { 'Ф' } else { 'ф' }),
+            'g' => result.push(if is_upper { 'Г' } else { 'г' }),
+            'h' => result.push(if is_upper { 'Х' } else { 'х' }),
+            'i' => result.push(if is_upper { 'И' } else { 'и' }),
+            'j' => result.push(if is_upper { 'Ж' } else { 'ж' }),
+            'k' => result.push(if is_upper { 'К' } else { 'к' }),
+            'l' => result.push(if is_upper { 'Л' } else { 'л' }),
+            'm' => result.push(if is_upper { 'М' } else { 'м' }),
+            'n' => result.push(if is_upper { 'Н' } else { 'н' }),
+            'o' => result.push(if is_upper { 'О' } else { 'о' }),
+            'p' => result.push(if is_upper { 'П' } else { 'п' }),
+            'q' => result.push(if is_upper { 'К' } else { 'к' }),
+            'r' => result.push(if is_upper { 'Р' } else { 'р' }),
+            's' => result.push(if is_upper { 'С' } else { 'с' }),
+            't' => result.push(if is_upper { 'Т' } else { 'т' }),
+            'u' => result.push(if is_upper { 'У' } else { 'у' }),
+            'v' => result.push(if is_upper { 'В' } else { 'в' }),
+            'w' => result.push(if is_upper { 'Щ' } else { 'щ' }),
+            'x' => result.push_str(if is_upper { "КС" } else { "кс" }),
+            'y' => result.push(if is_upper { 'Ы' } else { 'ы' }),
+            'z' => result.push(if is_upper { 'З' } else { 'з' }),
+            _ => result.push(c),  // Keep numbers, punctuation, etc. as-is
+        }
+        i += 1;
+    }
+    result
+}
+
 /// Get the previous tab in order
 fn prev_tab(tab: Tab) -> Tab {
     match tab {
@@ -2245,7 +2398,7 @@ fn next_tab(tab: Tab) -> Tab {
 }
 
 /// Handle keyboard input
-fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimState, sim_running: &mut bool, sim_paused: &mut bool, new_keys: &[Key], window: &Window, pins: &[Pin]) {
+fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimState, sim_running: &mut bool, sim_paused: &mut bool, new_keys: &[Key], window: &Window, pins: &[Pin], synth_params: &Arc<Mutex<SynthParams>>) {
     // Track if any circuit changes are made (to cancel simulation)
     let mut made_changes = false;
 
@@ -2330,18 +2483,28 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimSt
             match key {
                 Key::Left | Key::H => {
                     editor.active_tab = prev_tab(editor.active_tab);
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::TabSwitch);
                     continue;
                 }
                 Key::Right | Key::L => {
                     editor.active_tab = next_tab(editor.active_tab);
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::TabSwitch);
                     continue;
                 }
                 // Shift + up/down for within-tab navigation (snippet/design/level/music selection)
                 Key::Up | Key::K => {
                     if editor.active_tab == Tab::DesignSnippets && !editor.snippets.is_empty() {
                         editor.selected_snippet = editor.selected_snippet.saturating_sub(1);
+                        // Adjust scroll offset to keep selected snippet visible
+                        if editor.selected_snippet < editor.snippet_scroll_offset {
+                            editor.snippet_scroll_offset = editor.selected_snippet;
+                        }
                     } else if editor.active_tab == Tab::Designs && !editor.designs.is_empty() {
                         editor.selected_design = editor.selected_design.saturating_sub(1);
+                        // Adjust scroll offset to keep selected design visible
+                        if editor.selected_design < editor.design_scroll_offset {
+                            editor.design_scroll_offset = editor.selected_design;
+                        }
                     } else if editor.active_tab == Tab::Verification && !editor.levels.is_empty() {
                         let prev_level = editor.selected_level;
                         editor.selected_level = editor.selected_level.saturating_sub(1);
@@ -2364,8 +2527,16 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimSt
                 Key::Down | Key::J => {
                     if editor.active_tab == Tab::DesignSnippets && !editor.snippets.is_empty() {
                         editor.selected_snippet = (editor.selected_snippet + 1).min(editor.snippets.len() - 1);
+                        // Adjust scroll offset to keep selected snippet visible (max 10 visible)
+                        if editor.selected_snippet >= editor.snippet_scroll_offset + 10 {
+                            editor.snippet_scroll_offset = editor.selected_snippet - 9;
+                        }
                     } else if editor.active_tab == Tab::Designs && !editor.designs.is_empty() {
                         editor.selected_design = (editor.selected_design + 1).min(editor.designs.len() - 1);
+                        // Adjust scroll offset to keep selected design visible (max 10 visible)
+                        if editor.selected_design >= editor.design_scroll_offset + 10 {
+                            editor.design_scroll_offset = editor.selected_design - 9;
+                        }
                     } else if editor.active_tab == Tab::Verification && !editor.levels.is_empty() {
                         let prev_level = editor.selected_level;
                         editor.selected_level = (editor.selected_level + 1).min(editor.levels.len() - 1);
@@ -2436,41 +2607,48 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimSt
         }
 
         match key {
-            // Mode switching (1-8)
+            // Mode switching (1-9)
             Key::Key1 => {
                 editor.mode = EditMode::NSilicon;
                 editor.path_start = None;
                 editor.current_path.clear();
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::ButtonClick);
             }
             Key::Key2 => {
                 editor.mode = EditMode::PSilicon;
                 editor.path_start = None;
                 editor.current_path.clear();
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::ButtonClick);
             }
             Key::Key3 => {
                 editor.mode = EditMode::Metal;
                 editor.path_start = None;
                 editor.current_path.clear();
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::ButtonClick);
             }
             Key::Key4 => {
                 editor.mode = EditMode::Via;
                 editor.path_start = None;
                 editor.current_path.clear();
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::ButtonClick);
             }
             Key::Key5 => {
                 editor.mode = EditMode::DeleteMetal;
                 editor.path_start = None;
                 editor.current_path.clear();
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::ButtonClick);
             }
             Key::Key6 => {
                 editor.mode = EditMode::DeleteSilicon;
                 editor.path_start = None;
                 editor.current_path.clear();
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::ButtonClick);
             }
             Key::Key7 => {
                 editor.mode = EditMode::DeleteAll;
                 editor.path_start = None;
                 editor.current_path.clear();
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::ButtonClick);
             }
             Key::Key8 => {
                 editor.mode = EditMode::Visual;
@@ -2478,6 +2656,7 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimSt
                 editor.path_start = None;
                 editor.current_path.clear();
                 editor.selection_anchor = None;
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::ButtonClick);
             }
             Key::Key9 => {
                 editor.mode = EditMode::MouseSelect;
@@ -2485,18 +2664,19 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimSt
                 editor.current_path.clear();
                 editor.selection_anchor = None;
                 editor.mouse_selection_end = None;
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::ButtonClick);
             }
 
             // Visual mode keys (only active in Visual mode)
             _ if editor.mode == EditMode::Visual => {
-                if handle_visual_mode_key(circuit, editor, *key, shift_held, ctrl_held) {
+                if handle_visual_mode_key(circuit, editor, *key, shift_held, ctrl_held, synth_params) {
                     made_changes = true;
                 }
             }
 
             // MouseSelect mode keys
             _ if editor.mode == EditMode::MouseSelect => {
-                if handle_mouse_select_key(circuit, editor, *key) {
+                if handle_mouse_select_key(circuit, editor, *key, shift_held, synth_params) {
                     made_changes = true;
                 }
             }
@@ -2519,7 +2699,7 @@ const PLAYABLE_WIDTH: usize = PLAYABLE_RIGHT - PLAYABLE_LEFT + 1; // 36
 
 /// Handle visual mode keyboard input
 /// Returns true if circuit was modified
-fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key, shift_held: bool, ctrl_held: bool) -> bool {
+fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key, shift_held: bool, ctrl_held: bool, synth_params: &Arc<Mutex<SynthParams>>) -> bool {
     let mut made_changes = false;
     let prev_x = editor.cursor_x;
     let prev_y = editor.cursor_y;
@@ -2587,6 +2767,7 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
                     made_changes = true;
                     editor.visual_state = VisualState::Normal;
                     editor.selection_anchor = None;
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
                 } else if is_playable(editor.cursor_x, editor.cursor_y) {
                     match modifier {
                         PendingModifier::Silicon => delete_silicon(circuit, editor.cursor_x, editor.cursor_y),
@@ -2594,6 +2775,7 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
                         _ => {}
                     }
                     made_changes = true;
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
                 }
                 editor.clear_modifier();
             }
@@ -2653,9 +2835,14 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
                 }
             }
 
-            // 'w' - move right by 4
+            // 'w' - write selection as snippet (opens dialog)
             Key::W => {
-                editor.cursor_x = (editor.cursor_x + 4).min(GRID_WIDTH - 1);
+                if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                    editor.yank_buffer = Some(yank_region(circuit, x1, y1, x2, y2, String::new()));
+                    editor.dialog = DialogState::SaveSnippet { name: String::new() };
+                    editor.visual_state = VisualState::Normal;
+                    editor.selection_anchor = None;
+                }
             }
 
             // 'b' - move left by 4 (back)
@@ -2695,9 +2882,11 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
                     made_changes = true;
                     editor.visual_state = VisualState::Normal;
                     editor.selection_anchor = None;
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
                 } else if is_playable(editor.cursor_x, editor.cursor_y) {
                     delete_all(circuit, editor.cursor_x, editor.cursor_y);
                     made_changes = true;
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
                 }
             }
 
@@ -2723,31 +2912,46 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
                     if let Some(node) = circuit.get_node(editor.cursor_x, editor.cursor_y) {
                         if node.via {
                             delete_via(circuit, editor.cursor_x, editor.cursor_y);
+                            synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
                         } else {
                             place_via(circuit, editor.cursor_x, editor.cursor_y);
+                            synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Place);
                         }
                         made_changes = true;
                     }
                 }
             }
 
-            // 'y' - yank (copy) selection to snippet (opens dialog if has selection)
+            // 'y' - yank (copy) selection to clipboard
             Key::Y => {
                 if let Some((x1, y1, x2, y2)) = editor.get_selection() {
-                    // Yank to buffer first
                     editor.yank_buffer = Some(yank_region(circuit, x1, y1, x2, y2, String::new()));
-                    // Open dialog to name the snippet
-                    editor.dialog = DialogState::SaveSnippet { name: String::new() };
                     editor.visual_state = VisualState::Normal;
                     editor.selection_anchor = None;
                 }
             }
 
-            // 'p' - paste from yank buffer or selected snippet
+            // 'x' - cut (yank to clipboard and delete)
+            Key::X => {
+                if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                    editor.yank_buffer = Some(yank_region(circuit, x1, y1, x2, y2, String::new()));
+                    delete_region(circuit, x1, y1, x2, y2);
+                    made_changes = true;
+                    editor.visual_state = VisualState::Normal;
+                    editor.selection_anchor = None;
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
+                }
+            }
+
+            // 'p' - paste from clipboard, 'P' (shift) - paste from selected snippet
             Key::P => {
-                // First try yank buffer, then selected snippet
-                let snippet_to_paste = editor.yank_buffer.clone()
-                    .or_else(|| editor.snippets.get(editor.selected_snippet).cloned());
+                let snippet_to_paste = if shift_held {
+                    // Shift+P: paste from selected snippet
+                    editor.snippets.get(editor.selected_snippet).cloned()
+                } else {
+                    // p: paste from clipboard
+                    editor.yank_buffer.clone()
+                };
 
                 if let Some(snippet) = snippet_to_paste {
                     paste_snippet(circuit, &snippet, editor.cursor_x, editor.cursor_y);
@@ -2755,16 +2959,21 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
                 }
             }
 
-            // 'r' - rotate the current snippet (yank buffer or selected)
+            // 'r' - rotate the clipboard (yank buffer)
+            // 'R' (shift) - rotate the selected snippet
             Key::R => {
-                // Rotate yank buffer if present
-                if let Some(ref snippet) = editor.yank_buffer {
-                    editor.yank_buffer = Some(rotate_snippet(snippet));
-                } else if !editor.snippets.is_empty() {
-                    // Rotate the selected snippet in place
-                    let idx = editor.selected_snippet;
-                    if idx < editor.snippets.len() {
-                        editor.snippets[idx] = rotate_snippet(&editor.snippets[idx]);
+                if shift_held {
+                    // Rotate selected snippet
+                    if !editor.snippets.is_empty() {
+                        let idx = editor.selected_snippet;
+                        if idx < editor.snippets.len() {
+                            editor.snippets[idx] = rotate_snippet(&editor.snippets[idx]);
+                        }
+                    }
+                } else {
+                    // Rotate clipboard
+                    if let Some(ref snippet) = editor.yank_buffer {
+                        editor.yank_buffer = Some(rotate_snippet(snippet));
                     }
                 }
             }
@@ -2790,14 +2999,17 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
             VisualState::PlacingN => {
                 place_silicon_path(circuit, &[(prev_x, prev_y), (editor.cursor_x, editor.cursor_y)], SiliconKind::N);
                 made_changes = true;
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Place);
             }
             VisualState::PlacingP => {
                 place_silicon_path(circuit, &[(prev_x, prev_y), (editor.cursor_x, editor.cursor_y)], SiliconKind::P);
                 made_changes = true;
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Place);
             }
             VisualState::PlacingMetal => {
                 place_metal_path(circuit, &[(prev_x, prev_y), (editor.cursor_x, editor.cursor_y)]);
                 made_changes = true;
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Place);
             }
             _ => {}
         }
@@ -2806,9 +3018,9 @@ fn handle_visual_mode_key(circuit: &mut Circuit, editor: &mut EditorState, key: 
     made_changes
 }
 
-/// Handle keys in MouseSelect mode (y, p, r, d, s, m, Escape)
+/// Handle keys in MouseSelect mode (y, p, r, d, s, m, w, x, Escape)
 /// Returns true if circuit was modified
-fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key) -> bool {
+fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key: Key, shift_held: bool, synth_params: &Arc<Mutex<SynthParams>>) -> bool {
     let mut made_changes = false;
     // Check if selection is finalized (both clicks done)
     let selection_finalized = editor.selection_anchor.is_some() && editor.mouse_selection_end.is_some();
@@ -2829,6 +3041,7 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
                             made_changes = true;
                             editor.selection_anchor = None;
                             editor.mouse_selection_end = None;
+                            synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
                         }
                     }
                     editor.clear_modifier();
@@ -2857,6 +3070,7 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
                             made_changes = true;
                             editor.selection_anchor = None;
                             editor.mouse_selection_end = None;
+                            synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
                         }
                     }
                     editor.clear_modifier();
@@ -2885,8 +3099,19 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
             editor.pending_modifier = PendingModifier::Metal;
         }
 
-        // 'y' - yank selection (only when finalized)
+        // 'y' - yank selection to clipboard (only when finalized)
         Key::Y => {
+            if selection_finalized {
+                if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                    editor.yank_buffer = Some(yank_region(circuit, x1, y1, x2, y2, String::new()));
+                    editor.selection_anchor = None;
+                    editor.mouse_selection_end = None;
+                }
+            }
+        }
+
+        // 'w' - write selection as snippet (opens dialog, only when finalized)
+        Key::W => {
             if selection_finalized {
                 if let Some((x1, y1, x2, y2)) = editor.get_selection() {
                     editor.yank_buffer = Some(yank_region(circuit, x1, y1, x2, y2, String::new()));
@@ -2895,10 +3120,31 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
             }
         }
 
-        // 'p' - paste (works anytime)
+        // 'x' - cut (yank to clipboard and delete, only when finalized)
+        Key::X => {
+            if selection_finalized {
+                if let Some((x1, y1, x2, y2)) = editor.get_selection() {
+                    editor.yank_buffer = Some(yank_region(circuit, x1, y1, x2, y2, String::new()));
+                    for y in y1..=y2 {
+                        for x in x1..=x2 {
+                            delete_all(circuit, x, y);
+                        }
+                    }
+                    made_changes = true;
+                    editor.selection_anchor = None;
+                    editor.mouse_selection_end = None;
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
+                }
+            }
+        }
+
+        // 'p' - paste from clipboard, 'P' (shift) - paste from selected snippet
         Key::P => {
-            let snippet_to_paste = editor.yank_buffer.clone()
-                .or_else(|| editor.snippets.get(editor.selected_snippet).cloned());
+            let snippet_to_paste = if shift_held {
+                editor.snippets.get(editor.selected_snippet).cloned()
+            } else {
+                editor.yank_buffer.clone()
+            };
 
             if let Some(snippet) = snippet_to_paste {
                 paste_snippet(circuit, &snippet, editor.cursor_x, editor.cursor_y);
@@ -2906,14 +3152,20 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
             }
         }
 
-        // 'r' - rotate snippet
+        // 'r' - rotate clipboard, 'R' (shift) - rotate selected snippet
         Key::R => {
-            if let Some(ref snippet) = editor.yank_buffer {
-                editor.yank_buffer = Some(rotate_snippet(snippet));
-            } else if !editor.snippets.is_empty() {
-                let idx = editor.selected_snippet;
-                if idx < editor.snippets.len() {
-                    editor.snippets[idx] = rotate_snippet(&editor.snippets[idx]);
+            if shift_held {
+                // Rotate selected snippet
+                if !editor.snippets.is_empty() {
+                    let idx = editor.selected_snippet;
+                    if idx < editor.snippets.len() {
+                        editor.snippets[idx] = rotate_snippet(&editor.snippets[idx]);
+                    }
+                }
+            } else {
+                // Rotate clipboard
+                if let Some(ref snippet) = editor.yank_buffer {
+                    editor.yank_buffer = Some(rotate_snippet(snippet));
                 }
             }
         }
@@ -2930,6 +3182,7 @@ fn handle_mouse_select_key(circuit: &mut Circuit, editor: &mut EditorState, key:
                     made_changes = true;
                     editor.selection_anchor = None;
                     editor.mouse_selection_end = None;
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
                 }
             }
         }
@@ -2975,6 +3228,7 @@ fn handle_mouse(
     right_clicked: bool,
     left_down: bool,
     _right_down: bool,
+    synth_params: &Arc<Mutex<SynthParams>>,
 ) -> bool {
     let mut made_changes = false;
     let (grid_x, grid_y) = match (editor.mouse_grid_x, editor.mouse_grid_y) {
@@ -2996,14 +3250,17 @@ fn handle_mouse(
                         EditMode::NSilicon => {
                             place_silicon_path(circuit, &editor.current_path, SiliconKind::N);
                             made_changes = true;
+                            synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Place);
                         }
                         EditMode::PSilicon => {
                             place_silicon_path(circuit, &editor.current_path, SiliconKind::P);
                             made_changes = true;
+                            synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Place);
                         }
                         EditMode::Metal => {
                             place_metal_path(circuit, &editor.current_path);
                             made_changes = true;
+                            synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Place);
                         }
                         _ => {}
                     }
@@ -3023,10 +3280,12 @@ fn handle_mouse(
             if left_clicked {
                 place_via(circuit, grid_x, grid_y);
                 made_changes = true;
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Place);
             }
             if right_clicked {
                 delete_via(circuit, grid_x, grid_y);
                 made_changes = true;
+                synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
             }
         }
 
@@ -3035,6 +3294,10 @@ fn handle_mouse(
             if left_down || right_clicked {
                 delete_metal(circuit, grid_x, grid_y);
                 made_changes = true;
+                // Play sound on initial click, not while held
+                if left_clicked || right_clicked {
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
+                }
             }
         }
 
@@ -3043,6 +3306,10 @@ fn handle_mouse(
             if left_down || right_clicked {
                 delete_silicon(circuit, grid_x, grid_y);
                 made_changes = true;
+                // Play sound on initial click, not while held
+                if left_clicked || right_clicked {
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
+                }
             }
         }
 
@@ -3051,6 +3318,10 @@ fn handle_mouse(
             if left_down || right_clicked {
                 delete_all(circuit, grid_x, grid_y);
                 made_changes = true;
+                // Play sound on initial click, not while held
+                if left_clicked || right_clicked {
+                    synth_params.lock().unwrap().sfx_queue.push(SoundEffect::Delete);
+                }
             }
         }
 
@@ -3078,13 +3349,10 @@ fn handle_mouse(
                     editor.mouse_selection_end = None;
                 }
             }
-            // Right click pastes (same as 'p')
+            // Right click pastes from clipboard (same as 'p')
             if right_clicked {
-                let snippet_to_paste = editor.yank_buffer.clone()
-                    .or_else(|| editor.snippets.get(editor.selected_snippet).cloned());
-
-                if let Some(snippet) = snippet_to_paste {
-                    paste_snippet(circuit, &snippet, editor.cursor_x, editor.cursor_y);
+                if let Some(ref snippet) = editor.yank_buffer {
+                    paste_snippet(circuit, snippet, editor.cursor_x, editor.cursor_y);
                     made_changes = true;
                 }
             }
@@ -3093,7 +3361,176 @@ fn handle_mouse(
     made_changes
 }
 
-/// Setup the synth audio engine using fundsp and cpal
+/// Active sound effect state
+struct ActiveSfx {
+    effect: SoundEffect,
+    time: f64,        // Current time in seconds
+    duration: f64,    // Total duration
+    phase1: f64,      // Oscillator 1 phase
+    phase2: f64,      // Oscillator 2 phase
+    noise_state: u32, // Simple noise LFSR
+}
+
+impl ActiveSfx {
+    fn new(effect: SoundEffect) -> Self {
+        let duration = match effect {
+            SoundEffect::ButtonClick => 0.025,  // Thocky click
+            SoundEffect::TabSwitch => 0.025,    // Thocky click
+            SoundEffect::Place => 0.015,        // Short percussive click
+            SoundEffect::Delete => 0.12,
+            SoundEffect::Blocked => 0.08,
+            SoundEffect::VerifySuccess => 0.35, // Triumphant arpeggio
+            SoundEffect::VerifyFail => 0.25,    // Sad descending
+        };
+        Self {
+            effect,
+            time: 0.0,
+            duration,
+            phase1: 0.0,
+            phase2: 0.0,
+            noise_state: 0xACE1,
+        }
+    }
+
+    /// Generate one sample, returns None when finished
+    fn generate(&mut self, sample_rate: f64) -> Option<f64> {
+        if self.time >= self.duration {
+            return None;
+        }
+
+        let t = self.time / self.duration; // 0 to 1 progress
+        let dt = 1.0 / sample_rate;
+
+        // Envelope: quick attack, linear decay
+        let env = (1.0 - t).powf(0.5) * (self.time * 200.0).min(1.0);
+
+        let output = match self.effect {
+            SoundEffect::ButtonClick | SoundEffect::TabSwitch => {
+                // Thocky mechanical sound: noise + low resonant thump
+                // Generate noise
+                self.noise_state ^= self.noise_state << 13;
+                self.noise_state ^= self.noise_state >> 17;
+                self.noise_state ^= self.noise_state << 5;
+                let noise = (self.noise_state as f64 / u32::MAX as f64) * 2.0 - 1.0;
+
+                // Resonant thump with pitch drop
+                let thump_freq = 120.0 * (1.0 - t * 0.6);
+                self.phase1 += thump_freq * dt;
+                if self.phase1 >= 1.0 { self.phase1 -= 1.0; }
+                let thump = (self.phase1 * std::f64::consts::TAU).sin();
+
+                // Two-stage envelope: sharp attack, medium decay
+                let thock_env = (-self.time * 150.0).exp();
+
+                (noise * 0.3 + thump * 0.7) * thock_env
+            }
+            SoundEffect::Place => {
+                // Percussive click: filtered noise burst with fast decay
+                // Generate noise
+                self.noise_state ^= self.noise_state << 13;
+                self.noise_state ^= self.noise_state >> 17;
+                self.noise_state ^= self.noise_state << 5;
+                let noise = (self.noise_state as f64 / u32::MAX as f64) * 2.0 - 1.0;
+
+                // Add a low thump for body (quick pitch drop)
+                let thump_freq = 180.0 * (1.0 - t * 0.8);
+                self.phase1 += thump_freq * dt;
+                if self.phase1 >= 1.0 { self.phase1 -= 1.0; }
+                let thump = (self.phase1 * std::f64::consts::TAU).sin();
+
+                // Sharp exponential decay
+                let click_env = (-self.time * 300.0).exp();
+
+                (noise * 0.4 + thump * 0.6) * click_env
+            }
+            SoundEffect::Delete => {
+                // Descending sweep 150→25 Hz (octave down from 300→50)
+                let freq = 150.0 - 125.0 * t;
+                self.phase1 += freq * dt;
+                if self.phase1 >= 1.0 { self.phase1 -= 1.0; }
+                let square = if self.phase1 < 0.5 { 1.0 } else { -1.0 };
+                square * 0.5 * env
+            }
+            SoundEffect::Blocked => {
+                // Two detuned low squares 55/58.5 Hz (octave down from 110/117)
+                self.phase1 += 55.0 * dt;
+                self.phase2 += 58.5 * dt;
+                if self.phase1 >= 1.0 { self.phase1 -= 1.0; }
+                if self.phase2 >= 1.0 { self.phase2 -= 1.0; }
+                let sq1 = if self.phase1 < 0.5 { 1.0 } else { -1.0 };
+                let sq2 = if self.phase2 < 0.5 { 1.0 } else { -1.0 };
+                (sq1 + sq2) * 0.3 * env
+            }
+            SoundEffect::VerifySuccess => {
+                // Ascending triumphant arpeggio: C5 -> E5 -> G5 -> C6
+                // Each note ~87ms (0.35 / 4)
+                let note_idx = (t * 4.0).floor() as usize;
+                let note_t = (t * 4.0).fract();
+                let freqs = [523.25, 659.25, 783.99, 1046.50]; // C5, E5, G5, C6
+                let freq = freqs[note_idx.min(3)];
+
+                self.phase1 += freq * dt;
+                if self.phase1 >= 1.0 { self.phase1 -= 1.0; }
+
+                // Triangle wave for pleasant tone
+                let tri = if self.phase1 < 0.5 {
+                    self.phase1 * 4.0 - 1.0
+                } else {
+                    3.0 - self.phase1 * 4.0
+                };
+
+                // Per-note envelope with quick attack, sustain, quick release
+                let note_env = if note_t < 0.1 {
+                    note_t * 10.0  // Attack
+                } else if note_t > 0.8 {
+                    (1.0 - note_t) * 5.0  // Release
+                } else {
+                    1.0  // Sustain
+                };
+
+                tri * 0.5 * note_env * (1.0 - t * 0.3)  // Overall fade
+            }
+            SoundEffect::VerifyFail => {
+                // Sad descending two-note: minor second down (E4 -> Eb4) with wobble
+                let note_idx = (t * 2.0).floor() as usize;
+                let note_t = (t * 2.0).fract();
+                let base_freqs = [329.63, 311.13]; // E4, Eb4 (minor second)
+                let base_freq = base_freqs[note_idx.min(1)];
+
+                // Add slight vibrato/wobble for sad effect
+                let vibrato = (self.time * 12.0 * std::f64::consts::TAU).sin() * 3.0;
+                let freq = base_freq + vibrato;
+
+                self.phase1 += freq * dt;
+                if self.phase1 >= 1.0 { self.phase1 -= 1.0; }
+
+                // Square wave with slight detuning for harsh/sad tone
+                self.phase2 += (freq * 1.01) * dt;
+                if self.phase2 >= 1.0 { self.phase2 -= 1.0; }
+
+                let sq1 = if self.phase1 < 0.5 { 1.0 } else { -1.0 };
+                let sq2 = if self.phase2 < 0.5 { 1.0 } else { -1.0 };
+
+                // Per-note envelope
+                let note_env = if note_t < 0.05 {
+                    note_t * 20.0
+                } else {
+                    (1.0 - note_t).powf(0.7)
+                };
+
+                (sq1 * 0.4 + sq2 * 0.3) * note_env * env
+            }
+        };
+
+        // Bit-crush for 8-bit character (quantize to ~16 levels)
+        let crushed = (output * 8.0).round() / 8.0;
+
+        self.time += dt;
+        Some(crushed)
+    }
+}
+
+/// Setup the synth audio engine using cpal
 /// Returns a handle to keep the stream alive
 fn setup_synth_audio(params: Arc<Mutex<SynthParams>>) -> Option<cpal::Stream> {
     let host = cpal::default_host();
@@ -3113,21 +3550,30 @@ fn setup_synth_audio(params: Arc<Mutex<SynthParams>>) -> Option<cpal::Stream> {
     let mut lfo_phase: f64 = 0.0;
     let mut current_freqs: [f32; 4] = [0.0; 4];
     let mut last_trigger = false;
+    let mut filter_state: f64 = 0.0;
+
+    // Active sound effects (up to 4 concurrent)
+    let mut active_sfx: Vec<ActiveSfx> = Vec::with_capacity(4);
 
     let stream = device.build_output_stream(
         &config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let params = params_clone.lock().unwrap().clone();
+            // Lock params, drain sfx queue, clone rest
+            let (params, new_sfx) = {
+                let mut p = params_clone.lock().unwrap();
+                let sfx = std::mem::take(&mut p.sfx_queue);
+                (p.clone(), sfx)
+            };
 
-            if !params.playing {
-                // Output silence when not playing
-                for sample in data.iter_mut() {
-                    *sample = 0.0;
+            // Add new sound effects
+            for sfx in new_sfx {
+                if active_sfx.len() < 4 {
+                    active_sfx.push(ActiveSfx::new(sfx));
                 }
-                env_level = 0.0;
-                env_stage = 0;
-                return;
             }
+
+            // Process ambient synth
+            let synth_playing = params.playing;
 
             // Check for chord trigger
             if params.chord_trigger && !last_trigger {
@@ -3137,7 +3583,7 @@ fn setup_synth_audio(params: Arc<Mutex<SynthParams>>) -> Option<cpal::Stream> {
             last_trigger = params.chord_trigger;
 
             // If no freqs set yet, use current chord
-            if current_freqs[0] == 0.0 {
+            if synth_playing && current_freqs[0] == 0.0 {
                 current_freqs = params.chords[params.current_step].frequencies();
                 env_stage = 1;
             }
@@ -3147,87 +3593,101 @@ fn setup_synth_audio(params: Arc<Mutex<SynthParams>>) -> Option<cpal::Stream> {
             let release_rate = 1.0 / (params.release as f64 * sample_rate);
 
             for frame in data.chunks_mut(channels) {
-                // LFO
-                lfo_phase += params.lfo_rate as f64 / sample_rate;
-                if lfo_phase >= 1.0 { lfo_phase -= 1.0; }
-                let lfo = (lfo_phase * std::f64::consts::TAU).sin();
+                let mut synth_out: f64 = 0.0;
 
-                // Filter cutoff modulated by LFO
-                let cutoff = params.filter_cutoff as f64
-                    + lfo * params.lfo_amount as f64 * params.filter_cutoff as f64;
-                let cutoff = cutoff.clamp(100.0, 4000.0);
+                if synth_playing {
+                    // LFO
+                    lfo_phase += params.lfo_rate as f64 / sample_rate;
+                    if lfo_phase >= 1.0 { lfo_phase -= 1.0; }
+                    let lfo = (lfo_phase * std::f64::consts::TAU).sin();
 
-                // Generate oscillators (4 notes, 2 oscs each)
-                let mut mix: f64 = 0.0;
-                for i in 0..4 {
-                    let freq = current_freqs[i] as f64;
-                    if freq <= 0.0 { continue; }
+                    // Filter cutoff modulated by LFO
+                    let cutoff = params.filter_cutoff as f64
+                        + lfo * params.lfo_amount as f64 * params.filter_cutoff as f64;
+                    let cutoff = cutoff.clamp(100.0, 4000.0);
 
-                    // OSC 1
-                    let idx1 = i * 2;
-                    phase[idx1] += freq / sample_rate;
-                    if phase[idx1] >= 1.0 { phase[idx1] -= 1.0; }
+                    // Generate oscillators (4 notes, 2 oscs each)
+                    let mut mix: f64 = 0.0;
+                    for i in 0..4 {
+                        let freq = current_freqs[i] as f64;
+                        if freq <= 0.0 { continue; }
 
-                    // OSC 2 (detuned)
-                    let idx2 = i * 2 + 1;
-                    phase[idx2] += (freq * detune_ratio) / sample_rate;
-                    if phase[idx2] >= 1.0 { phase[idx2] -= 1.0; }
+                        // OSC 1
+                        let idx1 = i * 2;
+                        phase[idx1] += freq / sample_rate;
+                        if phase[idx1] >= 1.0 { phase[idx1] -= 1.0; }
 
-                    // Generate waveform
-                    let osc1 = match params.waveform {
-                        OscWaveform::Saw => phase[idx1] * 2.0 - 1.0,
-                        OscWaveform::Square => if phase[idx1] < 0.5 { 1.0 } else { -1.0 },
-                        OscWaveform::Triangle => {
-                            if phase[idx1] < 0.5 { phase[idx1] * 4.0 - 1.0 }
-                            else { 3.0 - phase[idx1] * 4.0 }
+                        // OSC 2 (detuned)
+                        let idx2 = i * 2 + 1;
+                        phase[idx2] += (freq * detune_ratio) / sample_rate;
+                        if phase[idx2] >= 1.0 { phase[idx2] -= 1.0; }
+
+                        // Generate waveform
+                        let osc1 = match params.waveform {
+                            OscWaveform::Saw => phase[idx1] * 2.0 - 1.0,
+                            OscWaveform::Square => if phase[idx1] < 0.5 { 1.0 } else { -1.0 },
+                            OscWaveform::Triangle => {
+                                if phase[idx1] < 0.5 { phase[idx1] * 4.0 - 1.0 }
+                                else { 3.0 - phase[idx1] * 4.0 }
+                            }
+                        };
+                        let osc2 = match params.waveform {
+                            OscWaveform::Saw => phase[idx2] * 2.0 - 1.0,
+                            OscWaveform::Square => if phase[idx2] < 0.5 { 1.0 } else { -1.0 },
+                            OscWaveform::Triangle => {
+                                if phase[idx2] < 0.5 { phase[idx2] * 4.0 - 1.0 }
+                                else { 3.0 - phase[idx2] * 4.0 }
+                            }
+                        };
+
+                        mix += (osc1 + osc2) * 0.125;
+                    }
+
+                    // Simple one-pole lowpass filter
+                    let alpha = (std::f64::consts::TAU * cutoff / sample_rate).min(1.0);
+                    filter_state += alpha * (mix - filter_state);
+                    mix = filter_state;
+
+                    // Envelope
+                    match env_stage {
+                        1 => {
+                            env_level += attack_rate;
+                            if env_level >= 1.0 {
+                                env_level = 1.0;
+                                env_stage = 2;
+                            }
                         }
-                    };
-                    let osc2 = match params.waveform {
-                        OscWaveform::Saw => phase[idx2] * 2.0 - 1.0,
-                        OscWaveform::Square => if phase[idx2] < 0.5 { 1.0 } else { -1.0 },
-                        OscWaveform::Triangle => {
-                            if phase[idx2] < 0.5 { phase[idx2] * 4.0 - 1.0 }
-                            else { 3.0 - phase[idx2] * 4.0 }
+                        2 => { env_level = 1.0; }
+                        3 => {
+                            env_level -= release_rate;
+                            if env_level <= 0.0 {
+                                env_level = 0.0;
+                                env_stage = 0;
+                            }
                         }
-                    };
+                        _ => {}
+                    }
 
-                    mix += (osc1 + osc2) * 0.125; // 4 notes * 2 oscs = divide by 8
+                    synth_out = mix * env_level * params.volume as f64;
+                } else {
+                    env_level = 0.0;
+                    env_stage = 0;
                 }
 
-                // Simple one-pole lowpass filter
-                let alpha = (std::f64::consts::TAU * cutoff / sample_rate).min(1.0);
-                static mut FILTER_STATE: f64 = 0.0;
-                unsafe {
-                    FILTER_STATE += alpha * (mix - FILTER_STATE);
-                    mix = FILTER_STATE;
-                }
-
-                // Envelope
-                match env_stage {
-                    1 => { // Attack
-                        env_level += attack_rate;
-                        if env_level >= 1.0 {
-                            env_level = 1.0;
-                            env_stage = 2;
-                        }
+                // Generate sound effects
+                let mut sfx_out: f64 = 0.0;
+                active_sfx.retain_mut(|sfx| {
+                    if let Some(sample) = sfx.generate(sample_rate) {
+                        sfx_out += sample * 0.3; // SFX volume
+                        true
+                    } else {
+                        false
                     }
-                    2 => { // Sustain (hold at 1.0)
-                        env_level = 1.0;
-                    }
-                    3 => { // Release
-                        env_level -= release_rate;
-                        if env_level <= 0.0 {
-                            env_level = 0.0;
-                            env_stage = 0;
-                        }
-                    }
-                    _ => {}
-                }
+                });
 
-                // Apply envelope and volume
-                let output = (mix * env_level * params.volume as f64) as f32;
+                // Mix synth and sfx
+                let output = (synth_out + sfx_out).clamp(-1.0, 1.0) as f32;
 
-                // Write to all channels
                 for sample in frame.iter_mut() {
                     *sample = output;
                 }
@@ -3480,7 +3940,7 @@ fn setup_test_pattern(circuit: &mut Circuit) {
 // Rendering
 // ============================================================================
 
-fn render(circuit: &Circuit, editor: &EditorState, synth_params: &SynthParams, pins: &[Pin], font: &HashMap<char, Vec<Vec<bool>>>, sim: &SimState, sim_running: bool, sim_waveform_index: usize, buffer: &mut [u32]) {
+fn render(circuit: &Circuit, editor: &EditorState, synth_params: &SynthParams, pins: &[Pin], font: &HashMap<char, Vec<Vec<bool>>>, sim: &SimState, sim_running: bool, sim_waveform_index: usize, shift_held: bool, tab_held: bool, buffer: &mut [u32]) {
     // Fill background
     for pixel in buffer.iter_mut() {
         *pixel = COLOR_BACKGROUND;
@@ -3545,14 +4005,18 @@ fn render(circuit: &Circuit, editor: &EditorState, synth_params: &SynthParams, p
         }
     }
 
-    // Draw ghost preview of snippet when Snippets tab is active and in visual/mouse-select mode
-    if (editor.mode == EditMode::Visual || editor.mode == EditMode::MouseSelect) && editor.active_tab == Tab::DesignSnippets {
-        // Try yank buffer first, then selected snippet
-        let snippet_to_preview = editor.yank_buffer.as_ref()
-            .or_else(|| editor.snippets.get(editor.selected_snippet));
-
-        if let Some(snippet) = snippet_to_preview {
-            render_snippet_ghost(snippet, editor.cursor_x, editor.cursor_y, buffer);
+    // Draw ghost preview when in visual/mouse-select mode:
+    // - Tab held: show clipboard (yank buffer)
+    // - Shift held on Snippets tab: show selected snippet
+    if editor.mode == EditMode::Visual || editor.mode == EditMode::MouseSelect {
+        if tab_held {
+            if let Some(ref snippet) = editor.yank_buffer {
+                render_snippet_ghost(snippet, editor.cursor_x, editor.cursor_y, buffer);
+            }
+        } else if shift_held && editor.active_tab == Tab::DesignSnippets {
+            if let Some(snippet) = editor.snippets.get(editor.selected_snippet) {
+                render_snippet_ghost(snippet, editor.cursor_x, editor.cursor_y, buffer);
+            }
         }
     }
 
@@ -3563,36 +4027,36 @@ fn render(circuit: &Circuit, editor: &EditorState, synth_params: &SynthParams, p
 
     // Draw mode indicator at top-left (shows current mode, submode, and pending modifier)
     let mode_text = match editor.mode {
-        EditMode::NSilicon => "1:N-Si",
-        EditMode::PSilicon => "2:P-Si",
-        EditMode::Metal => "3:Metal",
-        EditMode::Via => "4:Via",
-        EditMode::DeleteMetal => "5:DelM",
-        EditMode::DeleteSilicon => "6:DelS",
-        EditMode::DeleteAll => "7:DelA",
+        EditMode::NSilicon => "1:Н-СИ",
+        EditMode::PSilicon => "2:П-СИ",
+        EditMode::Metal => "3:МЕТ",
+        EditMode::Via => "4:ВИА",
+        EditMode::DeleteMetal => "5:ДЕМ",
+        EditMode::DeleteSilicon => "6:ДЕС",
+        EditMode::DeleteAll => "7:ДЕЛ",
         EditMode::Visual => match editor.pending_modifier {
-            PendingModifier::Silicon => "8:s-",
-            PendingModifier::Metal => "8:m-",
-            PendingModifier::Goto => "8:g-",
+            PendingModifier::Silicon => "8:с-",
+            PendingModifier::Metal => "8:м-",
+            PendingModifier::Goto => "8:г-",
             PendingModifier::None => match editor.visual_state {
-                VisualState::Normal => "8:Vis",
-                VisualState::Selecting => "8:V-Sel",
-                VisualState::PlacingN => "8:V-N",
-                VisualState::PlacingP => "8:V-P",
-                VisualState::PlacingMetal => "8:V-M",
+                VisualState::Normal => "8:ВИЗ",
+                VisualState::Selecting => "8:В-СЕЛ",
+                VisualState::PlacingN => "8:В-N",
+                VisualState::PlacingP => "8:В-P",
+                VisualState::PlacingMetal => "8:В-М",
             },
         },
         EditMode::MouseSelect => match editor.pending_modifier {
-            PendingModifier::Silicon => "9:s-",
-            PendingModifier::Metal => "9:m-",
-            PendingModifier::Goto => "9:g-",
+            PendingModifier::Silicon => "9:с-",
+            PendingModifier::Metal => "9:м-",
+            PendingModifier::Goto => "9:г-",
             PendingModifier::None => {
                 if editor.mouse_selection_end.is_some() {
-                    "9:Ready"  // Selection finalized, ready for y/d/p
+                    "9:РДИ"  // Selection finalized, ready for y/d/p
                 } else if editor.selection_anchor.is_some() {
-                    "9:Sel.."  // Waiting for second click
+                    "9:СЕЛ.."  // Waiting for second click
                 } else {
-                    "9:MSel"   // No selection yet
+                    "9:МАУС"   // No selection yet
                 }
             }
         }
@@ -3607,10 +4071,10 @@ fn render(circuit: &Circuit, editor: &EditorState, synth_params: &SynthParams, p
 
     // Draw dialog overlay if open
     if let DialogState::SaveSnippet { ref name } = editor.dialog {
-        render_dialog("SAVE DESIGN SNIPPET", "Enter name for snippet:", name, font, buffer);
+        render_dialog("СЕЙВ СНИППЕТ", "НЕЙМ:", name, font, buffer);
     }
     if let DialogState::SaveDesign { ref name } = editor.dialog {
-        render_dialog("SAVE DESIGN", "Enter name for design:", name, font, buffer);
+        render_dialog("СЕЙВ ДИЗАЙН", "НЕЙМ:", name, font, buffer);
     }
 }
 
@@ -3681,13 +4145,14 @@ fn render_dialog(title: &str, prompt: &str, input: &str, font: &HashMap<char, Ve
         }
     }
 
-    // Draw input text (left-aligned)
-    let display_text = if input.is_empty() { "snippet" } else { input };
-    draw_text_left(display_text, input_x + 5, input_y + input_h / 2, font, if input.is_empty() { 0x808080 } else { COLOR_BUTTON_TEXT }, buffer);
+    // Draw input text (left-aligned) - transliterate to Cyrillic for display
+    let transliterated = transliterate_to_cyrillic(input);
+    let display_text = if input.is_empty() { "сниппет".to_string() } else { transliterated.clone() };
+    draw_text_left(&display_text, input_x + 5, input_y + input_h / 2, font, if input.is_empty() { 0x808080 } else { COLOR_BUTTON_TEXT }, buffer);
 
-    // Draw cursor - calculate actual text width from font
+    // Draw cursor - calculate actual text width from transliterated font
     let mut text_width = 0;
-    for ch in input.chars() {
+    for ch in transliterated.chars() {
         if let Some(glyph) = font.get(&ch) {
             text_width += glyph.get(0).map(|r| r.len()).unwrap_or(0) + 1;
         }
@@ -3702,44 +4167,44 @@ fn render_dialog(title: &str, prompt: &str, input: &str, font: &HashMap<char, Ve
     }
 
     // Draw hint
-    draw_text("Enter: save | Esc: cancel", dialog_x + dialog_w / 2, dialog_y + dialog_h - 15, font, 0x606060, buffer);
+    draw_text("ЕНТЕР: СЕЙВ | ЕСК: КАНСЕЛ", dialog_x + dialog_w / 2, dialog_y + dialog_h - 15, font, 0x606060, buffer);
 }
 
 /// Get context-sensitive help text based on current mode/state
 fn get_help_text(editor: &EditorState) -> &'static str {
     match editor.mode {
         EditMode::Visual => match editor.pending_modifier {
-            PendingModifier::Silicon => "d:del silicon | e:find silicon | Esc:cancel",
-            PendingModifier::Metal => "d:del metal | e:find metal | Esc:cancel",
-            PendingModifier::Goto => "g:top | e:bottom | d:half-down | u:half-up | h:half-right | b:half-left",
+            PendingModifier::Silicon => "d:ДЕЛ СИЛИКОН | e:ФИНД | Esc:КАНСЕЛ",
+            PendingModifier::Metal => "d:ДЕЛ МЕТАЛ | e:ФИНД | Esc:КАНСЕЛ",
+            PendingModifier::Goto => "g:ТОП | e:БОТОМ | d:ДАУН | u:АП | h:РАЙТ | b:ЛЕФТ",
             PendingModifier::None => match editor.visual_state {
-                VisualState::Normal => "hjkl:move w/b:fast e:find | v:select | -+=.d y p r",
-                VisualState::Selecting => "hjkl:extend | y:yank | d/sd/md:delete | Esc:cancel",
-                VisualState::PlacingN => "hjkl:draw N-silicon | Esc:stop",
-                VisualState::PlacingP => "hjkl:draw P-silicon | Esc:stop",
-                VisualState::PlacingMetal => "hjkl:draw metal | Esc:stop",
+                VisualState::Normal => "hjkl:МУВ b:ФАСТ e:ФИНД | v:СЕЛЕКТ | -+=.d y x p r P R w",
+                VisualState::Selecting => "hjkl:ЕКСПАНД | y:КОПИ x:КАТ w:СЕЙВ | d/sd/md:ДЕЛ | Esc:КАНСЕЛ",
+                VisualState::PlacingN => "hjkl:ДРАУ Н-СИЛИКОН | Esc:СТОП",
+                VisualState::PlacingP => "hjkl:ДРАУ П-СИЛИКОН | Esc:СТОП",
+                VisualState::PlacingMetal => "hjkl:ДРАУ МЕТАЛ | Esc:СТОП",
             },
         },
         EditMode::MouseSelect => match editor.pending_modifier {
-            PendingModifier::Silicon => "d:del silicon | Esc:cancel",
-            PendingModifier::Metal => "d:del metal | Esc:cancel",
+            PendingModifier::Silicon => "d:ДЕЛ СИЛИКОН | Esc:КАНСЕЛ",
+            PendingModifier::Metal => "d:ДЕЛ МЕТАЛ | Esc:КАНСЕЛ",
             _ => {
                 if editor.mouse_selection_end.is_some() {
-                    "y:yank | d/sd/md:delete | p/RClick:paste | r:rotate | Click:new | Esc:clear"
+                    "y:КОПИ x:КАТ w:СЕЙВ | d/sd/md:ДЕЛ | p/РМБ:ПЕЙСТ r:РОТ | P:СНИППЕТ R:РОТ | Esc"
                 } else if editor.selection_anchor.is_some() {
-                    "Click to set 2nd corner | Esc:cancel"
+                    "КЛИК ФОР 2НД КОРНЕР | Esc:КАНСЕЛ"
                 } else {
-                    "Click to set 1st corner | p/RClick:paste | r:rotate"
+                    "КЛИК ФОР 1СТ КОРНЕР | p/РМБ:ПЕЙСТ r:РОТ | P:СНИППЕТ R:РОТ"
                 }
             }
         }
-        EditMode::NSilicon => "Click start, click end to place N-silicon | Esc/RClick:cancel",
-        EditMode::PSilicon => "Click start, click end to place P-silicon | Esc/RClick:cancel",
-        EditMode::Metal => "Click start, click end to place metal | Esc/RClick:cancel",
-        EditMode::Via => "LClick:place via | RClick:delete via",
-        EditMode::DeleteMetal => "Click/drag to delete metal",
-        EditMode::DeleteSilicon => "Click/drag to delete silicon",
-        EditMode::DeleteAll => "Click/drag to delete everything",
+        EditMode::NSilicon => "КЛИК СТАРТ, КЛИК ЕНД ФОР Н-СИЛИКОН | Esc/РМБ:КАНСЕЛ",
+        EditMode::PSilicon => "КЛИК СТАРТ, КЛИК ЕНД ФОР П-СИЛИКОН | Esc/РМБ:КАНСЕЛ",
+        EditMode::Metal => "КЛИК СТАРТ, КЛИК ЕНД ФОР МЕТАЛ | Esc/РМБ:КАНСЕЛ",
+        EditMode::Via => "ЛМБ:ПЛЕЙС ВИА | РМБ:ДЕЛИТ",
+        EditMode::DeleteMetal => "КЛИК/ДРАГ ТУ ДЕЛИТ МЕТАЛ",
+        EditMode::DeleteSilicon => "КЛИК/ДРАГ ТУ ДЕЛИТ СИЛИКОН",
+        EditMode::DeleteAll => "КЛИК/ДРАГ ТУ ДЕЛИТ АЛЛ",
     }
 }
 
@@ -3762,12 +4227,12 @@ fn render_bottom_area(editor: &EditorState, synth_params: &SynthParams, font: &H
 
     // Draw tabs
     let tabs = [
-        (Tab::Specifications, "Data"),
-        (Tab::Verification, "Verify"),
-        (Tab::DesignSnippets, "Snippets"),
-        (Tab::Designs, "Designs"),
-        (Tab::Help, "Help"),
-        (Tab::Menu, "Menu"),
+        (Tab::Specifications, "СПЕКС"),
+        (Tab::Verification, "ТЕСТ"),
+        (Tab::DesignSnippets, "СНИПС"),
+        (Tab::Designs, "ДИЗНС"),
+        (Tab::Help, "ХЕЛП"),
+        (Tab::Menu, "СИНѲ"),
     ];
 
     let tab_width = WINDOW_WIDTH / tabs.len();
@@ -3811,13 +4276,30 @@ fn render_bottom_area(editor: &EditorState, synth_params: &SynthParams, font: &H
             render_designs_tab(editor, content_y, font, buffer);
         }
         Tab::Help => {
-            let help_lines = [
-                "Shift+arrows: switch tabs | Shift+j/k: scroll snippets",
-                "Shift+D: delete snippet | y: yank | p: paste | r: rotate",
-                "v: start selection | d: delete | sd/md: delete silicon/metal",
+            // Left column: transistor behavior
+            let left_lines = [
+                "ТРАНЗИСТОРС:",
+                "Н-ТАЙП КРОССИНГ П-ТАЙП = Н-ХАННЕЛ",
+                "  КОНДАКТС ЩХЕН ГЕЙТ = ХАЙ (1)",
+                "",
+                "П-ТАЙП КРОССИНГ Н-ТАЙП = П-ХАННЕЛ",
+                "  КОНДАКТС ЩХЕН ГЕЙТ = ЛОУ (0)",
             ];
-            for (i, line) in help_lines.iter().enumerate() {
-                draw_text(line, 10, content_y + 15 + i * 16, font, COLOR_BUTTON_TEXT, buffer);
+            for (i, line) in left_lines.iter().enumerate() {
+                draw_text(line, 10, content_y + 12 + i * 14, font, COLOR_BUTTON_TEXT, buffer);
+            }
+
+            // Right column: keyboard shortcuts
+            let right_lines = [
+                "КИБОАРД:",
+                "Shift+АРРОУС: ТАБС | Shift+j/k: СКРОЛЛ",
+                "y: КОПИ x: КАТ w: СЕЙВ",
+                "p: ПЕЙСТ r: РОТ | P: СНИППЕТ R: РОТ",
+                "v: СЕЛЕКТ | d: ДЕЛ",
+                "sd/md: ДЕЛ СИЛИКОН/МЕТАЛ",
+            ];
+            for (i, line) in right_lines.iter().enumerate() {
+                draw_text(line, 400, content_y + 12 + i * 14, font, COLOR_BUTTON_TEXT, buffer);
             }
         }
         Tab::Menu => {
@@ -3922,8 +4404,8 @@ fn render_menu_tab(editor: &EditorState, synth_params: &SynthParams, content_y: 
         }
     };
 
-    // === SECTION: СЕК (Sequencer) ===
-    draw_text_left("СЕК", seq_x, content_y + 10, font, label_color, buffer);
+    // === SECTION: SEQ (Sequencer) ===
+    draw_text_left("СЕКВЕНС", seq_x, content_y + 10, font, label_color, buffer);
     draw_underline(seq_x, content_y + 24, 200, buffer);
 
     // Chord buttons (4 in a row)
@@ -3951,7 +4433,7 @@ fn render_menu_tab(editor: &EditorState, synth_params: &SynthParams, content_y: 
     // Detune slider (label above, bar below)
     let detune_label_y = mode_y + 28;
     let detune_bar_y = detune_label_y + 14;
-    draw_text_left("РАССТР", seq_x, detune_label_y, font, label_color, buffer);
+    draw_text_left("ДЕТУН", seq_x, detune_label_y, font, label_color, buffer);
     let detune_selected = editor.synth_control == SynthControl::Detune;
     draw_slider(seq_x, detune_bar_y, slider_w, synth_params.detune / 20.0, detune_selected, buffer);
     let detune_text = format!("{:.0}c", synth_params.detune);
@@ -3960,20 +4442,20 @@ fn render_menu_tab(editor: &EditorState, synth_params: &SynthParams, content_y: 
     // BPM slider (label above, bar below)
     let bpm_label_y = detune_bar_y + row_height - 14;
     let bpm_bar_y = bpm_label_y + 14;
-    draw_text_left("ТЕМП", seq_x, bpm_label_y, font, label_color, buffer);
+    draw_text_left("БПМ", seq_x, bpm_label_y, font, label_color, buffer);
     let bpm_selected = editor.synth_control == SynthControl::BPM;
     draw_slider(seq_x, bpm_bar_y, slider_w, (synth_params.bpm - 10.0) / 150.0, bpm_selected, buffer);
     let bpm_text = format!("{:.0}", synth_params.bpm);
     draw_text_left(&bpm_text, seq_x + slider_w + 5, bpm_bar_y, font, value_color, buffer);
 
-    // === SECTION: ФИЛЬТР (Filter) ===
-    draw_text_left("ФИЛЬТР", filter_x, content_y + 10, font, label_color, buffer);
+    // === SECTION: FILTER ===
+    draw_text_left("ФИЛТЕР", filter_x, content_y + 10, font, label_color, buffer);
     draw_underline(filter_x, content_y + 24, 200, buffer);
 
     // Cutoff slider
     let cutoff_label_y = content_y + 35;
     let cutoff_bar_y = cutoff_label_y + 14;
-    draw_text_left("ЧАСТОТА", filter_x, cutoff_label_y, font, label_color, buffer);
+    draw_text_left("КАТОФФ", filter_x, cutoff_label_y, font, label_color, buffer);
     let cutoff_selected = editor.synth_control == SynthControl::Cutoff;
     draw_slider(filter_x, cutoff_bar_y, slider_w, (synth_params.filter_cutoff - 200.0) / 1800.0, cutoff_selected, buffer);
     let cutoff_text = format!("{:.0}Hz", synth_params.filter_cutoff);
@@ -3982,7 +4464,7 @@ fn render_menu_tab(editor: &EditorState, synth_params: &SynthParams, content_y: 
     // LFO Amount slider
     let lfo_amt_label_y = cutoff_bar_y + row_height - 14;
     let lfo_amt_bar_y = lfo_amt_label_y + 14;
-    draw_text_left("ГЛУБИНА", filter_x, lfo_amt_label_y, font, label_color, buffer);
+    draw_text_left("ЛФО АМТ", filter_x, lfo_amt_label_y, font, label_color, buffer);
     let lfo_amt_selected = editor.synth_control == SynthControl::LfoAmount;
     draw_slider(filter_x, lfo_amt_bar_y, slider_w, synth_params.lfo_amount, lfo_amt_selected, buffer);
     let lfo_amt_text = format!("{:.0}%", synth_params.lfo_amount * 100.0);
@@ -3991,20 +4473,20 @@ fn render_menu_tab(editor: &EditorState, synth_params: &SynthParams, content_y: 
     // LFO Rate slider
     let lfo_rate_label_y = lfo_amt_bar_y + row_height - 14;
     let lfo_rate_bar_y = lfo_rate_label_y + 14;
-    draw_text_left("СКОРОСТЬ", filter_x, lfo_rate_label_y, font, label_color, buffer);
+    draw_text_left("ЛФО РЕЙТ", filter_x, lfo_rate_label_y, font, label_color, buffer);
     let lfo_rate_selected = editor.synth_control == SynthControl::LfoRate;
     draw_slider(filter_x, lfo_rate_bar_y, slider_w, (synth_params.lfo_rate - 0.05) / 1.95, lfo_rate_selected, buffer);
     let lfo_rate_text = format!("{:.2}Hz", synth_params.lfo_rate);
     draw_text_left(&lfo_rate_text, filter_x + slider_w + 5, lfo_rate_bar_y, font, value_color, buffer);
 
-    // === SECTION: ОГИБАЮЩАЯ (Envelope) ===
-    draw_text_left("ОГИБАЮЩ", env_x, content_y + 10, font, label_color, buffer);
+    // === SECTION: ENVELOPE ===
+    draw_text_left("ЕНВЕЛОП", env_x, content_y + 10, font, label_color, buffer);
     draw_underline(env_x, content_y + 24, 200, buffer);
 
     // Attack slider
     let attack_label_y = content_y + 35;
     let attack_bar_y = attack_label_y + 14;
-    draw_text_left("АТАКА", env_x, attack_label_y, font, label_color, buffer);
+    draw_text_left("АТАК", env_x, attack_label_y, font, label_color, buffer);
     let attack_selected = editor.synth_control == SynthControl::Attack;
     draw_slider(env_x, attack_bar_y, slider_w, (synth_params.attack - 0.1) / 4.9, attack_selected, buffer);
     let attack_text = format!("{:.1}s", synth_params.attack);
@@ -4013,7 +4495,7 @@ fn render_menu_tab(editor: &EditorState, synth_params: &SynthParams, content_y: 
     // Release slider
     let release_label_y = attack_bar_y + row_height - 14;
     let release_bar_y = release_label_y + 14;
-    draw_text_left("СПАД", env_x, release_label_y, font, label_color, buffer);
+    draw_text_left("РЕЛИЗ", env_x, release_label_y, font, label_color, buffer);
     let release_selected = editor.synth_control == SynthControl::Release;
     draw_slider(env_x, release_bar_y, slider_w, (synth_params.release - 0.5) / 7.5, release_selected, buffer);
     let release_text = format!("{:.1}s", synth_params.release);
@@ -4023,13 +4505,13 @@ fn render_menu_tab(editor: &EditorState, synth_params: &SynthParams, content_y: 
     let play_y = content_y + 140;
     let play_w = 90;
     let play_h = 28;
-    let play_text = if synth_params.playing { "СТОП" } else { "ПУСК" };
+    let play_text = if synth_params.playing { "СТОП" } else { "ПЛЕЙ" };
     draw_button(env_x, play_y, play_w, play_h, play_text, false, synth_params.playing, font, buffer);
 
     // Volume slider (label above, bar below)
     let vol_label_y = play_y + play_h + 12;
     let vol_bar_y = vol_label_y + 14;
-    draw_text_left("ГРОМКОСТЬ", env_x, vol_label_y, font, label_color, buffer);
+    draw_text_left("ВОЛУМ", env_x, vol_label_y, font, label_color, buffer);
     let vol_selected = editor.synth_control == SynthControl::Volume;
     draw_slider(env_x, vol_bar_y, slider_w, synth_params.volume, vol_selected, buffer);
     let vol_text = format!("{:.0}%", synth_params.volume * 100.0);
@@ -4057,8 +4539,8 @@ fn render_specifications_tab(editor: &EditorState, content_y: usize, font: &Hash
             }
         }
     } else {
-        draw_text_left("No level selected", 10, content_y + 20, font, 0x808080, buffer);
-        draw_text_left("Use Shift+Up/Down on Verify tab to select a level", 10, content_y + 40, font, 0x808080, buffer);
+        draw_text_left("НО ЛЕВЕЛ СЕЛЕКТЕД", 10, content_y + 20, font, 0x808080, buffer);
+        draw_text_left("Shift+АП/ДАУН ОН ТЕСТ ТАБ ТУ СЕЛЕКТ", 10, content_y + 40, font, 0x808080, buffer);
     }
 }
 
@@ -4074,13 +4556,26 @@ fn render_snippets_tab(editor: &EditorState, content_y: usize, font: &HashMap<ch
         }
     }
 
-    // Draw snippet list
+    // Draw snippet list (max 10 visible with scrolling)
+    let max_visible = 10;
     if editor.snippets.is_empty() {
-        draw_text("No snippets saved", 10, content_y + 20, font, 0x808080, buffer);
-        draw_text("Select area with 'v', then 'y' to save", 10, content_y + 40, font, 0x808080, buffer);
+        draw_text("НО СЕЙВД СНИППЕТС", 10, content_y + 20, font, 0x808080, buffer);
+        draw_text("СЕЛЕКТ ВИѲ 'в', ѲЕН 'щ' ТУ СЕЙВ", 10, content_y + 40, font, 0x808080, buffer);
     } else {
-        for (i, snippet) in editor.snippets.iter().enumerate() {
-            let item_y = content_y + 8 + i * 18;
+        // Draw scroll indicator if scrolled down
+        let list_start_y = if editor.snippet_scroll_offset > 0 {
+            draw_text_left("^", list_width / 2 - 4, content_y + 10, font, 0x606060, buffer);
+            content_y + 24  // Start list below up arrow
+        } else {
+            content_y + 8
+        };
+
+        let visible_snippets = editor.snippets.iter().enumerate()
+            .skip(editor.snippet_scroll_offset)
+            .take(max_visible);
+
+        for (idx, (i, snippet)) in visible_snippets.enumerate() {
+            let item_y = list_start_y + idx * 18;
             if item_y + 16 > WINDOW_HEIGHT {
                 break;
             }
@@ -4096,7 +4591,14 @@ fn render_snippets_tab(editor: &EditorState, content_y: usize, font: &HashMap<ch
                 }
             }
 
-            draw_text(&snippet.name, 10, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+            let display_name = transliterate_to_cyrillic(&snippet.name);
+            draw_text(&display_name, 10, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+        }
+
+        // Draw scroll indicator if more below
+        if editor.snippet_scroll_offset + max_visible < editor.snippets.len() {
+            let bottom_y = list_start_y + max_visible * 18;
+            draw_text_left("v", list_width / 2 - 4, bottom_y, font, 0x606060, buffer);
         }
     }
 
@@ -4174,13 +4676,26 @@ fn render_designs_tab(editor: &EditorState, content_y: usize, font: &HashMap<cha
         }
     }
 
-    // Draw design list
+    // Draw design list (max 10 visible with scrolling)
+    let max_visible = 10;
     if editor.designs.is_empty() {
-        draw_text("No designs saved", 10, content_y + 20, font, 0x808080, buffer);
-        draw_text("Press 'w' or Shift+W to save design", 10, content_y + 40, font, 0x808080, buffer);
+        draw_text("НО СЕЙВД ДИЗАЙНС", 10, content_y + 20, font, 0x808080, buffer);
+        draw_text("'щ' ОР Shift+Щ ТУ СЕЙВ", 10, content_y + 40, font, 0x808080, buffer);
     } else {
-        for (i, design) in editor.designs.iter().enumerate() {
-            let item_y = content_y + 8 + i * 18;
+        // Draw scroll indicator if scrolled down
+        let list_start_y = if editor.design_scroll_offset > 0 {
+            draw_text_left("^", list_width / 2 - 4, content_y + 10, font, 0x606060, buffer);
+            content_y + 24  // Start list below up arrow
+        } else {
+            content_y + 8
+        };
+
+        let visible_designs = editor.designs.iter().enumerate()
+            .skip(editor.design_scroll_offset)
+            .take(max_visible);
+
+        for (idx, (i, design)) in visible_designs.enumerate() {
+            let item_y = list_start_y + idx * 18;
             if item_y + 16 > WINDOW_HEIGHT {
                 break;
             }
@@ -4196,16 +4711,23 @@ fn render_designs_tab(editor: &EditorState, content_y: usize, font: &HashMap<cha
                 }
             }
 
-            draw_text(&design.name, 10, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+            let display_name = transliterate_to_cyrillic(&design.name);
+            draw_text(&display_name, 10, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+        }
+
+        // Draw scroll indicator if more below
+        if editor.design_scroll_offset + max_visible < editor.designs.len() {
+            let bottom_y = list_start_y + max_visible * 18;
+            draw_text_left("v", list_width / 2 - 4, bottom_y, font, 0x606060, buffer);
         }
     }
 
     // Draw instructions on the right side
     let preview_x = list_width + 10;
-    draw_text_left("Shift+J/K: navigate", preview_x, content_y + 20, font, 0x606060, buffer);
-    draw_text_left("Shift+R: load design", preview_x, content_y + 40, font, 0x606060, buffer);
-    draw_text_left("Shift+D: delete design", preview_x, content_y + 60, font, 0x606060, buffer);
-    draw_text_left("Shift+W: save design", preview_x, content_y + 80, font, 0x606060, buffer);
+    draw_text_left("Shift+J/K: НАВИГЕЙТ", preview_x, content_y + 20, font, 0x606060, buffer);
+    draw_text_left("Shift+R: ЛОАД", preview_x, content_y + 40, font, 0x606060, buffer);
+    draw_text_left("Shift+D: ДЕЛИТ", preview_x, content_y + 60, font, 0x606060, buffer);
+    draw_text_left("Shift+W: СЕЙВ", preview_x, content_y + 80, font, 0x606060, buffer);
 }
 
 /// Render the verification tab content (levels list and waveforms)
@@ -4223,20 +4745,23 @@ fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMa
     // Draw level list (max 10 visible with scrolling)
     let max_visible = 10;
     if editor.levels.is_empty() {
-        draw_text("No levels found", 10, content_y + 20, font, 0x808080, buffer);
-        draw_text("Add .json files to levels/", 10, content_y + 40, font, 0x808080, buffer);
+        draw_text("НО ЛЕВЕЛС ФАУНД", 10, content_y + 20, font, 0x808080, buffer);
+        draw_text("АДД .жсон ТУ levels/", 10, content_y + 40, font, 0x808080, buffer);
     } else {
-        // Draw scroll indicator if needed
-        if editor.level_scroll_offset > 0 {
-            draw_text_left("^", list_width / 2, content_y + 2, font, 0x606060, buffer);
-        }
+        // Draw scroll indicator if scrolled down
+        let list_start_y = if editor.level_scroll_offset > 0 {
+            draw_text_left("^", list_width / 2 - 4, content_y + 10, font, 0x606060, buffer);
+            content_y + 24  // Start list below up arrow
+        } else {
+            content_y + 8
+        };
 
         let visible_levels = editor.levels.iter().enumerate()
             .skip(editor.level_scroll_offset)
             .take(max_visible);
 
         for (idx, (i, level)) in visible_levels.enumerate() {
-            let item_y = content_y + 8 + idx * 18;
+            let item_y = list_start_y + idx * 18;
             if item_y + 16 > WINDOW_HEIGHT {
                 break;
             }
@@ -4262,8 +4787,8 @@ fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMa
 
         // Draw scroll indicator if more below
         if editor.level_scroll_offset + max_visible < editor.levels.len() {
-            let bottom_y = content_y + 8 + max_visible * 18;
-            draw_text_left("v", list_width / 2, bottom_y, font, 0x606060, buffer);
+            let bottom_y = list_start_y + max_visible * 18;
+            draw_text_left("v", list_width / 2 - 4, bottom_y, font, 0x606060, buffer);
         }
     }
 
@@ -4389,19 +4914,19 @@ fn render_verification_tab(editor: &EditorState, content_y: usize, font: &HashMa
 
     // Show simulation status or result
     if sim_running {
-        draw_text_left("RUNNING (Space to stop)", waveform_x, content_y + 10, font, 0x008800, buffer);
+        draw_text_left("РАННИНГ (СПЕЙС - СТОП)", waveform_x, content_y + 10, font, 0x008800, buffer);
     } else if let (Some(accuracy), Some(passed)) = (sim.last_accuracy, sim.last_passed) {
         // Show accuracy result
         let pct = (accuracy * 100.0) as u32;
         let result_text = if passed {
-            format!("{}% PASS", pct)
+            format!("{}% ПАССД", pct)
         } else {
-            format!("{}% FAIL", pct)
+            format!("{}% ФЕЙЛ", pct)
         };
         let result_color = if passed { 0x00aa00 } else { 0xff0000 };
         draw_text_left(&result_text, waveform_x, content_y + 10, font, result_color, buffer);
     } else {
-        draw_text_left("Press Space to simulate", waveform_x, content_y + 10, font, 0x606060, buffer);
+        draw_text_left("СПЕЙС ТУ СИМУЛЕЙТ", waveform_x, content_y + 10, font, 0x606060, buffer);
     }
 }
 
@@ -4458,6 +4983,7 @@ fn handle_synth_click(mx: usize, my: usize, editor: &mut EditorState, synth_para
             editor.synth_control = SynthControl::Chord(i);
             let mut params = synth_params.lock().unwrap();
             params.chords[i] = params.chords[i].next();
+            params.sfx_queue.push(SoundEffect::ButtonClick);
             return;
         }
     }
@@ -4470,6 +4996,7 @@ fn handle_synth_click(mx: usize, my: usize, editor: &mut EditorState, synth_para
         let new_mode = params.mode.next();
         params.chords = new_mode.default_chords();
         params.mode = new_mode;
+        params.sfx_queue.push(SoundEffect::ButtonClick);
         return;
     }
 
@@ -4478,6 +5005,7 @@ fn handle_synth_click(mx: usize, my: usize, editor: &mut EditorState, synth_para
         editor.synth_control = SynthControl::Waveform;
         let mut params = synth_params.lock().unwrap();
         params.waveform = params.waveform.next();
+        params.sfx_queue.push(SoundEffect::ButtonClick);
         return;
     }
 
@@ -4550,6 +5078,7 @@ fn handle_synth_click(mx: usize, my: usize, editor: &mut EditorState, synth_para
         if params.playing {
             params.chord_trigger = true;
         }
+        params.sfx_queue.push(SoundEffect::ButtonClick);
         return;
     }
 
@@ -4608,15 +5137,15 @@ fn render_panel(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>, buff
 
     // Button definitions: (mode, label, number, icon_type)
     let buttons: [(EditMode, &str, &str, ButtonIcon); 9] = [
-        (EditMode::NSilicon, "N-SI", "1", ButtonIcon::NSilicon),
-        (EditMode::PSilicon, "P-SI", "2", ButtonIcon::PSilicon),
-        (EditMode::Metal, "METAL", "3", ButtonIcon::Metal),
-        (EditMode::Via, "VIA", "4", ButtonIcon::Via),
-        (EditMode::DeleteMetal, "DEL M", "5", ButtonIcon::DeleteX),
-        (EditMode::DeleteSilicon, "DEL S", "6", ButtonIcon::DeleteX),
-        (EditMode::DeleteAll, "DEL", "7", ButtonIcon::DeleteX),
-        (EditMode::Visual, "VISUAL", "8", ButtonIcon::Select),
-        (EditMode::MouseSelect, "SELECT", "9", ButtonIcon::Select),
+        (EditMode::NSilicon, "Н-СИ", "1", ButtonIcon::NSilicon),
+        (EditMode::PSilicon, "П-СИ", "2", ButtonIcon::PSilicon),
+        (EditMode::Metal, "МЕТАЛ", "3", ButtonIcon::Metal),
+        (EditMode::Via, "ВИА", "4", ButtonIcon::Via),
+        (EditMode::DeleteMetal, "ДЕЛ М", "5", ButtonIcon::DeleteX),
+        (EditMode::DeleteSilicon, "ДЕЛ С", "6", ButtonIcon::DeleteX),
+        (EditMode::DeleteAll, "ДЕЛ", "7", ButtonIcon::DeleteX),
+        (EditMode::Visual, "СЕЛЕКТ", "8", ButtonIcon::Select),
+        (EditMode::MouseSelect, "МАУС", "9", ButtonIcon::Select),
     ];
 
     for (i, (mode, label, number, icon)) in buttons.iter().enumerate() {
