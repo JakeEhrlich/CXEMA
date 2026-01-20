@@ -1909,9 +1909,6 @@ fn main() {
     let pins = create_pins();
     setup_pins(&mut circuit, &pins);
 
-    // Add some test patterns to visualize
-    setup_test_pattern(&mut circuit);
-
     // Synth audio setup
     let synth_params = Arc::new(Mutex::new(SynthParams::default()));
     let _audio_stream = setup_synth_audio(Arc::clone(&synth_params));
@@ -4056,7 +4053,7 @@ fn render(circuit: &Circuit, editor: &EditorState, synth_params: &SynthParams, p
                 } else if editor.selection_anchor.is_some() {
                     "9:СЕЛ.."  // Waiting for second click
                 } else {
-                    "9:МАУС"   // No selection yet
+                    "9:СЕЛ"   // No selection yet
                 }
             }
         }
@@ -4286,20 +4283,20 @@ fn render_bottom_area(editor: &EditorState, synth_params: &SynthParams, font: &H
                 "  КОНДАКТС ЩХЕН ГЕЙТ = ЛОУ (0)",
             ];
             for (i, line) in left_lines.iter().enumerate() {
-                draw_text(line, 10, content_y + 12 + i * 14, font, COLOR_BUTTON_TEXT, buffer);
+                draw_text_left(line, 14, content_y + 12 + i * 14, font, COLOR_BUTTON_TEXT, buffer);
             }
 
             // Right column: keyboard shortcuts
             let right_lines = [
                 "КИБОАРД:",
-                "Shift+АРРОУС: ТАБС | Shift+j/k: СКРОЛЛ",
+                "Shift+АРРОУС: ТАБС",
+                "Shift+j/k: СКРОЛЛ",
                 "y: КОПИ x: КАТ w: СЕЙВ",
-                "p: ПЕЙСТ r: РОТ | P: СНИППЕТ R: РОТ",
-                "v: СЕЛЕКТ | d: ДЕЛ",
-                "sd/md: ДЕЛ СИЛИКОН/МЕТАЛ",
+                "p: ПЕЙСТ r: РОТ",
+                "P: СНИППЕТ R: РОТ",
             ];
             for (i, line) in right_lines.iter().enumerate() {
-                draw_text(line, 400, content_y + 12 + i * 14, font, COLOR_BUTTON_TEXT, buffer);
+                draw_text_left(line, 420, content_y + 12 + i * 14, font, COLOR_BUTTON_TEXT, buffer);
             }
         }
         Tab::Menu => {
@@ -4559,8 +4556,8 @@ fn render_snippets_tab(editor: &EditorState, content_y: usize, font: &HashMap<ch
     // Draw snippet list (max 10 visible with scrolling)
     let max_visible = 10;
     if editor.snippets.is_empty() {
-        draw_text("НО СЕЙВД СНИППЕТС", 10, content_y + 20, font, 0x808080, buffer);
-        draw_text("СЕЛЕКТ ВИѲ 'в', ѲЕН 'щ' ТУ СЕЙВ", 10, content_y + 40, font, 0x808080, buffer);
+        draw_text_left("НО СЕЙВД СНИППЕТС", 14, content_y + 20, font, 0x808080, buffer);
+        draw_text_left("СЕЛЕКТ ВИѲ 'в', ѲЕН 'щ' ТУ СЕЙВ", 14, content_y + 40, font, 0x808080, buffer);
     } else {
         // Draw scroll indicator if scrolled down
         let list_start_y = if editor.snippet_scroll_offset > 0 {
@@ -4583,7 +4580,7 @@ fn render_snippets_tab(editor: &EditorState, content_y: usize, font: &HashMap<ch
             // Highlight selected snippet
             if i == editor.selected_snippet {
                 for y in item_y - 2..item_y + 14 {
-                    for x in 2..list_width - 2 {
+                    for x in 8..list_width - 2 {
                         if y < WINDOW_HEIGHT {
                             buffer[y * WINDOW_WIDTH + x] = 0xa0c0ff; // Light blue highlight
                         }
@@ -4592,7 +4589,7 @@ fn render_snippets_tab(editor: &EditorState, content_y: usize, font: &HashMap<ch
             }
 
             let display_name = transliterate_to_cyrillic(&snippet.name);
-            draw_text(&display_name, 10, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+            draw_text_left(&display_name, 14, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
         }
 
         // Draw scroll indicator if more below
@@ -4679,8 +4676,8 @@ fn render_designs_tab(editor: &EditorState, content_y: usize, font: &HashMap<cha
     // Draw design list (max 10 visible with scrolling)
     let max_visible = 10;
     if editor.designs.is_empty() {
-        draw_text("НО СЕЙВД ДИЗАЙНС", 10, content_y + 20, font, 0x808080, buffer);
-        draw_text("'щ' ОР Shift+Щ ТУ СЕЙВ", 10, content_y + 40, font, 0x808080, buffer);
+        draw_text_left("НО СЕЙВД ДИЗАЙНС", 14, content_y + 20, font, 0x808080, buffer);
+        draw_text_left("'щ' ОР Shift+Щ ТУ СЕЙВ", 14, content_y + 40, font, 0x808080, buffer);
     } else {
         // Draw scroll indicator if scrolled down
         let list_start_y = if editor.design_scroll_offset > 0 {
@@ -4703,7 +4700,7 @@ fn render_designs_tab(editor: &EditorState, content_y: usize, font: &HashMap<cha
             // Highlight selected design
             if i == editor.selected_design {
                 for y in item_y - 2..item_y + 14 {
-                    for x in 2..list_width - 2 {
+                    for x in 8..list_width - 2 {
                         if y < WINDOW_HEIGHT {
                             buffer[y * WINDOW_WIDTH + x] = 0xa0c0ff; // Light blue highlight
                         }
@@ -4712,7 +4709,7 @@ fn render_designs_tab(editor: &EditorState, content_y: usize, font: &HashMap<cha
             }
 
             let display_name = transliterate_to_cyrillic(&design.name);
-            draw_text(&display_name, 10, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
+            draw_text_left(&display_name, 14, item_y + 6, font, COLOR_BUTTON_TEXT, buffer);
         }
 
         // Draw scroll indicator if more below
@@ -5144,8 +5141,8 @@ fn render_panel(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>, buff
         (EditMode::DeleteMetal, "ДЕЛ М", "5", ButtonIcon::DeleteX),
         (EditMode::DeleteSilicon, "ДЕЛ С", "6", ButtonIcon::DeleteX),
         (EditMode::DeleteAll, "ДЕЛ", "7", ButtonIcon::DeleteX),
-        (EditMode::Visual, "СЕЛЕКТ", "8", ButtonIcon::Select),
-        (EditMode::MouseSelect, "МАУС", "9", ButtonIcon::Select),
+        (EditMode::Visual, "ВИЗ", "8", ButtonIcon::Select),
+        (EditMode::MouseSelect, "СЕЛ", "9", ButtonIcon::Select),
     ];
 
     for (i, (mode, label, number, icon)) in buttons.iter().enumerate() {
