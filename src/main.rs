@@ -1,11 +1,12 @@
 use minifb::{Key, Window, WindowOptions};
-use rodio::{Decoder, OutputStream, Sink, Source};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // Grid dimensions (matches original game)
@@ -132,51 +133,185 @@ enum Tab {
     Menu,
 }
 
-/// Music track selection
+/// Chord types for the sequencer (7th chords for ambient sound)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MusicTrack {
-    None,
-    AnalogSequence,
-    GroovyBeat,
-    RetroLoop,
+enum Chord {
+    CMaj7,   // C E G B
+    Am7,     // A C E G
+    FMaj7,   // F A C E
+    G7,      // G B D F
+    Dm7,     // D F A C
+    Em7,     // E G B D
+    BbMaj7,  // Bb D F A
+    Gm7,     // G Bb D F
 }
 
-impl MusicTrack {
-    fn filename(&self) -> Option<&'static str> {
+impl Chord {
+    fn frequencies(&self) -> [f32; 4] {
+        // Base octave around C3 (130.81 Hz) for warm pad sound
         match self {
-            MusicTrack::None => None,
-            MusicTrack::AnalogSequence => Some("music/analog_sequence.wav"),
-            MusicTrack::GroovyBeat => Some("music/groovy_beat.wav"),
-            MusicTrack::RetroLoop => Some("music/retro_loop.wav"),
+            Chord::CMaj7  => [130.81, 164.81, 196.00, 246.94], // C E G B
+            Chord::Am7   => [110.00, 130.81, 164.81, 196.00], // A C E G
+            Chord::FMaj7  => [174.61, 220.00, 261.63, 329.63], // F A C E
+            Chord::G7     => [196.00, 246.94, 293.66, 349.23], // G B D F
+            Chord::Dm7    => [146.83, 174.61, 220.00, 261.63], // D F A C
+            Chord::Em7    => [164.81, 196.00, 246.94, 293.66], // E G B D
+            Chord::BbMaj7 => [116.54, 146.83, 174.61, 220.00], // Bb D F A
+            Chord::Gm7    => [196.00, 233.08, 293.66, 349.23], // G Bb D F
         }
     }
 
     fn display_name(&self) -> &'static str {
         match self {
-            MusicTrack::None => "No Music",
-            MusicTrack::AnalogSequence => "Analog Sequence",
-            MusicTrack::GroovyBeat => "Groovy Beat",
-            MusicTrack::RetroLoop => "Retro Loop",
+            Chord::CMaj7  => "Cmaj7",
+            Chord::Am7   => "Am7",
+            Chord::FMaj7  => "Fmaj7",
+            Chord::G7     => "G7",
+            Chord::Dm7    => "Dm7",
+            Chord::Em7    => "Em7",
+            Chord::BbMaj7 => "Bbmaj7",
+            Chord::Gm7    => "Gm7",
         }
     }
 
-    fn next(&self) -> MusicTrack {
+    fn all() -> &'static [Chord] {
+        &[
+            Chord::CMaj7, Chord::Am7, Chord::FMaj7, Chord::G7,
+            Chord::Dm7, Chord::Em7, Chord::BbMaj7, Chord::Gm7,
+        ]
+    }
+
+    fn next(&self) -> Chord {
+        let all = Self::all();
+        let idx = all.iter().position(|c| c == self).unwrap_or(0);
+        all[(idx + 1) % all.len()]
+    }
+
+    fn prev(&self) -> Chord {
+        let all = Self::all();
+        let idx = all.iter().position(|c| c == self).unwrap_or(0);
+        all[(idx + all.len() - 1) % all.len()]
+    }
+}
+
+/// Waveform type for oscillators
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscWaveform {
+    Saw,
+    Square,
+    Triangle,
+}
+
+impl OscWaveform {
+    fn display_name(&self) -> &'static str {
         match self {
-            MusicTrack::None => MusicTrack::AnalogSequence,
-            MusicTrack::AnalogSequence => MusicTrack::GroovyBeat,
-            MusicTrack::GroovyBeat => MusicTrack::RetroLoop,
-            MusicTrack::RetroLoop => MusicTrack::RetroLoop, // Stay at end
+            OscWaveform::Saw => "ПИЛА",      // Saw (Russian)
+            OscWaveform::Square => "ПРЯМОУГ", // Square/Rectangle
+            OscWaveform::Triangle => "ТРЕУГ",  // Triangle
         }
     }
 
-    fn prev(&self) -> MusicTrack {
+    fn next(&self) -> OscWaveform {
         match self {
-            MusicTrack::None => MusicTrack::None, // Stay at beginning
-            MusicTrack::AnalogSequence => MusicTrack::None,
-            MusicTrack::GroovyBeat => MusicTrack::AnalogSequence,
-            MusicTrack::RetroLoop => MusicTrack::GroovyBeat,
+            OscWaveform::Saw => OscWaveform::Square,
+            OscWaveform::Square => OscWaveform::Triangle,
+            OscWaveform::Triangle => OscWaveform::Saw,
         }
     }
+}
+
+/// Musical mode/scale for the synth
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MusicalMode {
+    Major,
+    Minor,
+    Dorian,
+    Mixolydian,
+}
+
+impl MusicalMode {
+    fn display_name(&self) -> &'static str {
+        match self {
+            MusicalMode::Major => "МАЖОР",
+            MusicalMode::Minor => "МИНОР",
+            MusicalMode::Dorian => "ДОРИАН",
+            MusicalMode::Mixolydian => "МИКСОЛ",
+        }
+    }
+
+    fn next(&self) -> MusicalMode {
+        match self {
+            MusicalMode::Major => MusicalMode::Minor,
+            MusicalMode::Minor => MusicalMode::Dorian,
+            MusicalMode::Dorian => MusicalMode::Mixolydian,
+            MusicalMode::Mixolydian => MusicalMode::Major,
+        }
+    }
+
+    fn default_chords(&self) -> [Chord; 4] {
+        match self {
+            MusicalMode::Major => [Chord::CMaj7, Chord::Am7, Chord::FMaj7, Chord::G7],
+            MusicalMode::Minor => [Chord::Am7, Chord::Dm7, Chord::FMaj7, Chord::Em7],
+            MusicalMode::Dorian => [Chord::Dm7, Chord::Em7, Chord::CMaj7, Chord::Am7],
+            MusicalMode::Mixolydian => [Chord::G7, Chord::FMaj7, Chord::Am7, Chord::CMaj7],
+        }
+    }
+}
+
+/// Synth parameters that can be shared with audio thread
+#[derive(Clone)]
+struct SynthParams {
+    playing: bool,
+    bpm: f32,              // 10-160
+    current_step: usize,   // 0-3
+    chords: [Chord; 4],
+    waveform: OscWaveform,
+    detune: f32,           // 0-20 cents
+    filter_cutoff: f32,    // 200-2000 Hz
+    lfo_amount: f32,       // 0-1
+    lfo_rate: f32,         // 0.05-2 Hz
+    attack: f32,           // 0.1-5 seconds
+    release: f32,          // 0.5-8 seconds
+    volume: f32,           // 0-1
+    mode: MusicalMode,
+    chord_trigger: bool,   // Set true to trigger new chord envelope
+}
+
+impl Default for SynthParams {
+    fn default() -> Self {
+        Self {
+            playing: false,
+            bpm: 15.0,
+            current_step: 0,
+            chords: MusicalMode::Major.default_chords(),
+            waveform: OscWaveform::Saw,
+            detune: 8.0,
+            filter_cutoff: 800.0,
+            lfo_amount: 0.3,
+            lfo_rate: 0.2,
+            attack: 2.0,
+            release: 3.0,
+            volume: 0.5,
+            mode: MusicalMode::Major,
+            chord_trigger: false,
+        }
+    }
+}
+
+/// Which control is currently selected for editing in the synth UI
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SynthControl {
+    Chord(usize),  // 0-3
+    Mode,
+    Waveform,
+    Detune,
+    BPM,
+    Cutoff,
+    LfoAmount,
+    LfoRate,
+    Attack,
+    Release,
+    Volume,
 }
 
 /// Dialog state for text input
@@ -250,9 +385,9 @@ struct EditorState {
     // Yank buffer for paste operations
     yank_buffer: Option<Snippet>,
 
-    // Music selection
-    current_music: MusicTrack,
-    music_changed: bool, // Flag to signal main loop to update music playback
+    // Synth UI state (selected control for keyboard navigation)
+    synth_control: SynthControl,
+    synth_chord_select: Option<usize>,  // Which chord slot is being edited (0-3)
 }
 
 impl EditorState {
@@ -285,8 +420,8 @@ impl EditorState {
             save_data,
             save_path,
             yank_buffer: None,
-            current_music: MusicTrack::None,
-            music_changed: false,
+            synth_control: SynthControl::BPM,
+            synth_chord_select: None,
         }
     }
 
@@ -1734,10 +1869,10 @@ fn main() {
     // Add some test patterns to visualize
     setup_test_pattern(&mut circuit);
 
-    // Audio setup for music playback
-    let (_stream, stream_handle) = OutputStream::try_default()
-        .expect("Failed to create audio output stream");
-    let sink = Sink::try_new(&stream_handle).expect("Failed to create audio sink");
+    // Synth audio setup
+    let synth_params = Arc::new(Mutex::new(SynthParams::default()));
+    let _audio_stream = setup_synth_audio(Arc::clone(&synth_params));
+    let mut synth_last_step = Instant::now();
 
     // Simulation state
     let mut sim = SimState::new();
@@ -1830,10 +1965,20 @@ fn main() {
         // Handle input
         handle_input(&mut circuit, &mut editor, &mut sim, &mut sim_running, &mut sim_paused, &new_keys, &window, &pins);
 
-        // Check if music selection changed via keyboard
-        if editor.music_changed {
-            play_music(editor.current_music, &sink);
-            editor.music_changed = false;
+        // Update synth sequencer timing
+        {
+            let mut params = synth_params.lock().unwrap();
+            if params.playing {
+                let step_duration = Duration::from_secs_f32(60.0 / params.bpm);
+                if synth_last_step.elapsed() >= step_duration {
+                    // Move to next chord
+                    params.current_step = (params.current_step + 1) % 4;
+                    params.chord_trigger = true;
+                    synth_last_step = Instant::now();
+                } else {
+                    params.chord_trigger = false;
+                }
+            }
         }
 
         // Get current mouse button states
@@ -1869,14 +2014,9 @@ fn main() {
                 }
             }
 
-            // Check for music button clicks in Menu tab
+            // Check for synth UI clicks in Menu tab
             if left_clicked && editor.active_tab == Tab::Menu {
-                if let Some(track) = get_clicked_music_button(mx, my) {
-                    if track != editor.current_music {
-                        editor.current_music = track;
-                        play_music(track, &sink);
-                    }
-                }
+                handle_synth_click(mx, my, &mut editor, &synth_params);
             }
 
             // Update grid position for non-panel area
@@ -2018,7 +2158,8 @@ fn main() {
         }
 
         // Render
-        render(&circuit, &editor, &pins, &font, &sim, sim_running, sim_waveform_index, &mut buffer);
+        let params_snapshot = synth_params.lock().unwrap().clone();
+        render(&circuit, &editor, &params_snapshot, &pins, &font, &sim, sim_running, sim_waveform_index, &mut buffer);
 
         window
             .update_with_buffer(&buffer, WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -2216,13 +2357,8 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimSt
                             sim.last_accuracy = None;
                             sim.last_passed = None;
                         }
-                    } else if editor.active_tab == Tab::Menu {
-                        let new_track = editor.current_music.prev();
-                        if new_track != editor.current_music {
-                            editor.current_music = new_track;
-                            editor.music_changed = true;
-                        }
                     }
+                    // Menu tab keyboard nav handled elsewhere
                     continue;
                 }
                 Key::Down | Key::J => {
@@ -2245,13 +2381,8 @@ fn handle_input(circuit: &mut Circuit, editor: &mut EditorState, sim: &mut SimSt
                             sim.last_accuracy = None;
                             sim.last_passed = None;
                         }
-                    } else if editor.active_tab == Tab::Menu {
-                        let new_track = editor.current_music.next();
-                        if new_track != editor.current_music {
-                            editor.current_music = new_track;
-                            editor.music_changed = true;
-                        }
                     }
+                    // Menu tab keyboard nav handled elsewhere
                     continue;
                 }
                 // Shift + D to delete selected snippet/design
@@ -2962,20 +3093,152 @@ fn handle_mouse(
     made_changes
 }
 
-/// Play the specified music track on the given sink (looping)
-fn play_music(track: MusicTrack, sink: &Sink) {
-    // Stop any currently playing music
-    sink.stop();
+/// Setup the synth audio engine using fundsp and cpal
+/// Returns a handle to keep the stream alive
+fn setup_synth_audio(params: Arc<Mutex<SynthParams>>) -> Option<cpal::Stream> {
+    let host = cpal::default_host();
+    let device = host.default_output_device()?;
+    let config = device.default_output_config().ok()?;
 
-    if let Some(filename) = track.filename() {
-        if let Ok(file) = File::open(filename) {
-            let reader = BufReader::new(file);
-            if let Ok(source) = Decoder::new(reader) {
-                sink.append(source.repeat_infinite());
-                sink.play();
+    let sample_rate = config.sample_rate().0 as f64;
+    let channels = config.channels() as usize;
+
+    // Create shared state for the audio callback
+    let params_clone = Arc::clone(&params);
+
+    // Audio state that lives in the callback
+    let mut phase: [f64; 8] = [0.0; 8]; // 4 notes * 2 oscs
+    let mut env_level: f64 = 0.0;
+    let mut env_stage: i32 = 0; // 0=off, 1=attack, 2=sustain, 3=release
+    let mut lfo_phase: f64 = 0.0;
+    let mut current_freqs: [f32; 4] = [0.0; 4];
+    let mut last_trigger = false;
+
+    let stream = device.build_output_stream(
+        &config.into(),
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let params = params_clone.lock().unwrap().clone();
+
+            if !params.playing {
+                // Output silence when not playing
+                for sample in data.iter_mut() {
+                    *sample = 0.0;
+                }
+                env_level = 0.0;
+                env_stage = 0;
+                return;
             }
-        }
-    }
+
+            // Check for chord trigger
+            if params.chord_trigger && !last_trigger {
+                current_freqs = params.chords[params.current_step].frequencies();
+                env_stage = 1; // Start attack
+            }
+            last_trigger = params.chord_trigger;
+
+            // If no freqs set yet, use current chord
+            if current_freqs[0] == 0.0 {
+                current_freqs = params.chords[params.current_step].frequencies();
+                env_stage = 1;
+            }
+
+            let detune_ratio = 2.0_f64.powf(params.detune as f64 / 1200.0);
+            let attack_rate = 1.0 / (params.attack as f64 * sample_rate);
+            let release_rate = 1.0 / (params.release as f64 * sample_rate);
+
+            for frame in data.chunks_mut(channels) {
+                // LFO
+                lfo_phase += params.lfo_rate as f64 / sample_rate;
+                if lfo_phase >= 1.0 { lfo_phase -= 1.0; }
+                let lfo = (lfo_phase * std::f64::consts::TAU).sin();
+
+                // Filter cutoff modulated by LFO
+                let cutoff = params.filter_cutoff as f64
+                    + lfo * params.lfo_amount as f64 * params.filter_cutoff as f64;
+                let cutoff = cutoff.clamp(100.0, 4000.0);
+
+                // Generate oscillators (4 notes, 2 oscs each)
+                let mut mix: f64 = 0.0;
+                for i in 0..4 {
+                    let freq = current_freqs[i] as f64;
+                    if freq <= 0.0 { continue; }
+
+                    // OSC 1
+                    let idx1 = i * 2;
+                    phase[idx1] += freq / sample_rate;
+                    if phase[idx1] >= 1.0 { phase[idx1] -= 1.0; }
+
+                    // OSC 2 (detuned)
+                    let idx2 = i * 2 + 1;
+                    phase[idx2] += (freq * detune_ratio) / sample_rate;
+                    if phase[idx2] >= 1.0 { phase[idx2] -= 1.0; }
+
+                    // Generate waveform
+                    let osc1 = match params.waveform {
+                        OscWaveform::Saw => phase[idx1] * 2.0 - 1.0,
+                        OscWaveform::Square => if phase[idx1] < 0.5 { 1.0 } else { -1.0 },
+                        OscWaveform::Triangle => {
+                            if phase[idx1] < 0.5 { phase[idx1] * 4.0 - 1.0 }
+                            else { 3.0 - phase[idx1] * 4.0 }
+                        }
+                    };
+                    let osc2 = match params.waveform {
+                        OscWaveform::Saw => phase[idx2] * 2.0 - 1.0,
+                        OscWaveform::Square => if phase[idx2] < 0.5 { 1.0 } else { -1.0 },
+                        OscWaveform::Triangle => {
+                            if phase[idx2] < 0.5 { phase[idx2] * 4.0 - 1.0 }
+                            else { 3.0 - phase[idx2] * 4.0 }
+                        }
+                    };
+
+                    mix += (osc1 + osc2) * 0.125; // 4 notes * 2 oscs = divide by 8
+                }
+
+                // Simple one-pole lowpass filter
+                let alpha = (std::f64::consts::TAU * cutoff / sample_rate).min(1.0);
+                static mut FILTER_STATE: f64 = 0.0;
+                unsafe {
+                    FILTER_STATE += alpha * (mix - FILTER_STATE);
+                    mix = FILTER_STATE;
+                }
+
+                // Envelope
+                match env_stage {
+                    1 => { // Attack
+                        env_level += attack_rate;
+                        if env_level >= 1.0 {
+                            env_level = 1.0;
+                            env_stage = 2;
+                        }
+                    }
+                    2 => { // Sustain (hold at 1.0)
+                        env_level = 1.0;
+                    }
+                    3 => { // Release
+                        env_level -= release_rate;
+                        if env_level <= 0.0 {
+                            env_level = 0.0;
+                            env_stage = 0;
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Apply envelope and volume
+                let output = (mix * env_level * params.volume as f64) as f32;
+
+                // Write to all channels
+                for sample in frame.iter_mut() {
+                    *sample = output;
+                }
+            }
+        },
+        |err| eprintln!("Audio error: {}", err),
+        None,
+    ).ok()?;
+
+    stream.play().ok()?;
+    Some(stream)
 }
 
 /// Load a BDF font file and return a map of character to bitmap data
@@ -3217,7 +3480,7 @@ fn setup_test_pattern(circuit: &mut Circuit) {
 // Rendering
 // ============================================================================
 
-fn render(circuit: &Circuit, editor: &EditorState, pins: &[Pin], font: &HashMap<char, Vec<Vec<bool>>>, sim: &SimState, sim_running: bool, sim_waveform_index: usize, buffer: &mut [u32]) {
+fn render(circuit: &Circuit, editor: &EditorState, synth_params: &SynthParams, pins: &[Pin], font: &HashMap<char, Vec<Vec<bool>>>, sim: &SimState, sim_running: bool, sim_waveform_index: usize, buffer: &mut [u32]) {
     // Fill background
     for pixel in buffer.iter_mut() {
         *pixel = COLOR_BACKGROUND;
@@ -3340,7 +3603,7 @@ fn render(circuit: &Circuit, editor: &EditorState, pins: &[Pin], font: &HashMap<
     render_panel(editor, font, buffer);
 
     // Draw the bottom area (help text and tabs)
-    render_bottom_area(editor, font, sim, sim_running, sim_waveform_index, buffer);
+    render_bottom_area(editor, synth_params, font, sim, sim_running, sim_waveform_index, buffer);
 
     // Draw dialog overlay if open
     if let DialogState::SaveSnippet { ref name } = editor.dialog {
@@ -3481,7 +3744,7 @@ fn get_help_text(editor: &EditorState) -> &'static str {
 }
 
 /// Render the bottom area with help text, tabs, and content
-fn render_bottom_area(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>, sim: &SimState, sim_running: bool, sim_waveform_index: usize, buffer: &mut [u32]) {
+fn render_bottom_area(editor: &EditorState, synth_params: &SynthParams, font: &HashMap<char, Vec<Vec<bool>>>, sim: &SimState, sim_running: bool, sim_waveform_index: usize, buffer: &mut [u32]) {
     let help_y = GRID_PIXEL_HEIGHT;
     let tab_y = help_y + HELP_AREA_HEIGHT;
     let content_y = tab_y + TAB_HEIGHT;
@@ -3558,7 +3821,7 @@ fn render_bottom_area(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>
             }
         }
         Tab::Menu => {
-            render_menu_tab(editor, content_y, font, buffer);
+            render_menu_tab(editor, synth_params, content_y, font, buffer);
         }
         Tab::Specifications => {
             render_specifications_tab(editor, content_y, font, buffer);
@@ -3566,71 +3829,211 @@ fn render_bottom_area(editor: &EditorState, font: &HashMap<char, Vec<Vec<bool>>>
     }
 }
 
-/// Render the menu tab content with music selection
-fn render_menu_tab(editor: &EditorState, content_y: usize, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
-    // Title
-    draw_text_left("Music Selection", 10, content_y + 12, font, COLOR_BUTTON_TEXT, buffer);
+/// Render the menu tab content with synth interface
+fn render_menu_tab(editor: &EditorState, synth_params: &SynthParams, content_y: usize, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]) {
+    // Layout constants (must match handle_synth_click)
+    let seq_x = 10;
+    let filter_x = 270;
+    let env_x = 530;
 
-    // Music track buttons
-    let tracks = [
-        MusicTrack::None,
-        MusicTrack::AnalogSequence,
-        MusicTrack::GroovyBeat,
-        MusicTrack::RetroLoop,
-    ];
+    let slider_h = 14;
+    let slider_w = 150;
+    let row_height = 36;  // Height for label + slider rows
+    let label_color = 0x404040;
+    let value_color = 0x606060;
+    let divider_color = 0x707070;
 
-    let btn_x = 10;
-    let btn_w = 180;
-    let btn_h = 28;
-    let btn_spacing = 6;
+    // Helper to draw a slider
+    let draw_slider = |x: usize, y: usize, w: usize, ratio: f32, selected: bool, buffer: &mut [u32]| {
+        // Background
+        for sy in y..y + slider_h {
+            for sx in x..x + w {
+                if sx < WINDOW_WIDTH && sy < WINDOW_HEIGHT {
+                    buffer[sy * WINDOW_WIDTH + sx] = 0x505050;
+                }
+            }
+        }
+        // Filled portion
+        let fill_w = ((w as f32 * ratio) as usize).min(w);
+        for sy in y..y + slider_h {
+            for sx in x..x + fill_w {
+                if sx < WINDOW_WIDTH && sy < WINDOW_HEIGHT {
+                    buffer[sy * WINDOW_WIDTH + sx] = if selected { 0x88aa44 } else { 0x668833 };
+                }
+            }
+        }
+        // Border
+        if selected {
+            for sx in x..x + w {
+                if sx < WINDOW_WIDTH {
+                    if y > 0 { buffer[(y - 1) * WINDOW_WIDTH + sx] = 0x00ff00; }
+                    if y + slider_h < WINDOW_HEIGHT { buffer[(y + slider_h) * WINDOW_WIDTH + sx] = 0x00ff00; }
+                }
+            }
+            for sy in y..y + slider_h {
+                if sy < WINDOW_HEIGHT {
+                    if x > 0 { buffer[sy * WINDOW_WIDTH + x - 1] = 0x00ff00; }
+                    if x + w < WINDOW_WIDTH { buffer[sy * WINDOW_WIDTH + x + w] = 0x00ff00; }
+                }
+            }
+        }
+    };
 
-    for (i, track) in tracks.iter().enumerate() {
-        let btn_y = content_y + 32 + i * (btn_h + btn_spacing);
-        let is_selected = editor.current_music == *track;
-
-        // Draw button background
-        for y in btn_y..btn_y + btn_h {
-            for x in btn_x..btn_x + btn_w {
-                if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
-                    let color = if y == btn_y || x == btn_x {
+    // Helper to draw a button
+    let draw_button = |x: usize, y: usize, w: usize, h: usize, text: &str, selected: bool, active: bool, font: &HashMap<char, Vec<Vec<bool>>>, buffer: &mut [u32]| {
+        let bg = if active { 0x556633 } else { COLOR_BUTTON_BG };
+        for by in y..y + h {
+            for bx in x..x + w {
+                if bx < WINDOW_WIDTH && by < WINDOW_HEIGHT {
+                    let color = if by == y || bx == x {
                         COLOR_BUTTON_LIGHT
-                    } else if y == btn_y + btn_h - 1 || x == btn_x + btn_w - 1 {
+                    } else if by == y + h - 1 || bx == x + w - 1 {
                         COLOR_BUTTON_DARK
                     } else {
-                        COLOR_BUTTON_BG
+                        bg
                     };
-                    buffer[y * WINDOW_WIDTH + x] = color;
+                    buffer[by * WINDOW_WIDTH + bx] = color;
                 }
             }
         }
-
-        // Draw selection indicator (green border)
-        if is_selected {
-            let border = 2;
-            for y in btn_y..btn_y + btn_h {
-                for x in btn_x..btn_x + btn_w {
-                    if x < WINDOW_WIDTH && y < WINDOW_HEIGHT {
-                        let on_border = x < btn_x + border || x >= btn_x + btn_w - border
-                            || y < btn_y + border || y >= btn_y + btn_h - border;
-                        if on_border {
-                            buffer[y * WINDOW_WIDTH + x] = 0x00aa00; // Green border for selected
-                        }
-                    }
+        if selected {
+            for bx in x..x + w {
+                if bx < WINDOW_WIDTH {
+                    if y > 0 { buffer[(y - 1) * WINDOW_WIDTH + bx] = 0x00ff00; }
+                    if y + h < WINDOW_HEIGHT { buffer[(y + h) * WINDOW_WIDTH + bx] = 0x00ff00; }
+                }
+            }
+            for by in y..y + h {
+                if by < WINDOW_HEIGHT {
+                    if x > 0 { buffer[by * WINDOW_WIDTH + x - 1] = 0x00ff00; }
+                    if x + w < WINDOW_WIDTH { buffer[by * WINDOW_WIDTH + x + w] = 0x00ff00; }
                 }
             }
         }
+        draw_text_left(text, x + 4, y + h / 2, font, COLOR_BUTTON_TEXT, buffer);
+    };
 
-        // Draw track name
-        let text_y = btn_y + btn_h / 2;
-        draw_text_left(track.display_name(), btn_x + 10, text_y, font, COLOR_BUTTON_TEXT, buffer);
+    // Helper to draw horizontal underline
+    let draw_underline = |x: usize, y: usize, w: usize, buffer: &mut [u32]| {
+        for sx in x..x + w {
+            if sx < WINDOW_WIDTH && y < WINDOW_HEIGHT {
+                buffer[y * WINDOW_WIDTH + sx] = divider_color;
+            }
+        }
+    };
+
+    // === SECTION: СЕК (Sequencer) ===
+    draw_text_left("СЕК", seq_x, content_y + 10, font, label_color, buffer);
+    draw_underline(seq_x, content_y + 24, 200, buffer);
+
+    // Chord buttons (4 in a row)
+    let chord_y = content_y + 32;
+    let chord_w = 55;
+    let chord_h = 24;
+    let chord_spacing = 5;
+
+    for i in 0..4 {
+        let btn_x = seq_x + i * (chord_w + chord_spacing);
+        let is_current = synth_params.current_step == i && synth_params.playing;
+        let is_selected = matches!(editor.synth_control, SynthControl::Chord(idx) if idx == i);
+        draw_button(btn_x, chord_y, chord_w, chord_h,
+                   synth_params.chords[i].display_name(),
+                   is_selected, is_current, font, buffer);
     }
 
-    // Attribution text
-    let attr_x = btn_x + btn_w + 40;
-    draw_text_left("Music from Freesound.org:", attr_x, content_y + 40, font, 0x606060, buffer);
-    draw_text_left("Analog Sequence - Xinematix (CC BY 4.0)", attr_x, content_y + 60, font, 0x707070, buffer);
-    draw_text_left("Groovy Beat - Seth_Makes_Sounds (CC0)", attr_x, content_y + 78, font, 0x707070, buffer);
-    draw_text_left("Retro Loop - ProdByRey (CC0)", attr_x, content_y + 96, font, 0x707070, buffer);
+    // Mode and Waveform on same row (no labels - self-explanatory)
+    let mode_y = chord_y + chord_h + 6;
+    let mode_selected = editor.synth_control == SynthControl::Mode;
+    draw_button(seq_x, mode_y, 95, 20, synth_params.mode.display_name(), mode_selected, false, font, buffer);
+    let wave_selected = editor.synth_control == SynthControl::Waveform;
+    draw_button(seq_x + 100, mode_y, 95, 20, synth_params.waveform.display_name(), wave_selected, false, font, buffer);
+
+    // Detune slider (label above, bar below)
+    let detune_label_y = mode_y + 28;
+    let detune_bar_y = detune_label_y + 14;
+    draw_text_left("РАССТР", seq_x, detune_label_y, font, label_color, buffer);
+    let detune_selected = editor.synth_control == SynthControl::Detune;
+    draw_slider(seq_x, detune_bar_y, slider_w, synth_params.detune / 20.0, detune_selected, buffer);
+    let detune_text = format!("{:.0}c", synth_params.detune);
+    draw_text_left(&detune_text, seq_x + slider_w + 5, detune_bar_y, font, value_color, buffer);
+
+    // BPM slider (label above, bar below)
+    let bpm_label_y = detune_bar_y + row_height - 14;
+    let bpm_bar_y = bpm_label_y + 14;
+    draw_text_left("ТЕМП", seq_x, bpm_label_y, font, label_color, buffer);
+    let bpm_selected = editor.synth_control == SynthControl::BPM;
+    draw_slider(seq_x, bpm_bar_y, slider_w, (synth_params.bpm - 10.0) / 150.0, bpm_selected, buffer);
+    let bpm_text = format!("{:.0}", synth_params.bpm);
+    draw_text_left(&bpm_text, seq_x + slider_w + 5, bpm_bar_y, font, value_color, buffer);
+
+    // === SECTION: ФИЛЬТР (Filter) ===
+    draw_text_left("ФИЛЬТР", filter_x, content_y + 10, font, label_color, buffer);
+    draw_underline(filter_x, content_y + 24, 200, buffer);
+
+    // Cutoff slider
+    let cutoff_label_y = content_y + 35;
+    let cutoff_bar_y = cutoff_label_y + 14;
+    draw_text_left("ЧАСТОТА", filter_x, cutoff_label_y, font, label_color, buffer);
+    let cutoff_selected = editor.synth_control == SynthControl::Cutoff;
+    draw_slider(filter_x, cutoff_bar_y, slider_w, (synth_params.filter_cutoff - 200.0) / 1800.0, cutoff_selected, buffer);
+    let cutoff_text = format!("{:.0}Hz", synth_params.filter_cutoff);
+    draw_text_left(&cutoff_text, filter_x + slider_w + 5, cutoff_bar_y, font, value_color, buffer);
+
+    // LFO Amount slider
+    let lfo_amt_label_y = cutoff_bar_y + row_height - 14;
+    let lfo_amt_bar_y = lfo_amt_label_y + 14;
+    draw_text_left("ГЛУБИНА", filter_x, lfo_amt_label_y, font, label_color, buffer);
+    let lfo_amt_selected = editor.synth_control == SynthControl::LfoAmount;
+    draw_slider(filter_x, lfo_amt_bar_y, slider_w, synth_params.lfo_amount, lfo_amt_selected, buffer);
+    let lfo_amt_text = format!("{:.0}%", synth_params.lfo_amount * 100.0);
+    draw_text_left(&lfo_amt_text, filter_x + slider_w + 5, lfo_amt_bar_y, font, value_color, buffer);
+
+    // LFO Rate slider
+    let lfo_rate_label_y = lfo_amt_bar_y + row_height - 14;
+    let lfo_rate_bar_y = lfo_rate_label_y + 14;
+    draw_text_left("СКОРОСТЬ", filter_x, lfo_rate_label_y, font, label_color, buffer);
+    let lfo_rate_selected = editor.synth_control == SynthControl::LfoRate;
+    draw_slider(filter_x, lfo_rate_bar_y, slider_w, (synth_params.lfo_rate - 0.05) / 1.95, lfo_rate_selected, buffer);
+    let lfo_rate_text = format!("{:.2}Hz", synth_params.lfo_rate);
+    draw_text_left(&lfo_rate_text, filter_x + slider_w + 5, lfo_rate_bar_y, font, value_color, buffer);
+
+    // === SECTION: ОГИБАЮЩАЯ (Envelope) ===
+    draw_text_left("ОГИБАЮЩ", env_x, content_y + 10, font, label_color, buffer);
+    draw_underline(env_x, content_y + 24, 200, buffer);
+
+    // Attack slider
+    let attack_label_y = content_y + 35;
+    let attack_bar_y = attack_label_y + 14;
+    draw_text_left("АТАКА", env_x, attack_label_y, font, label_color, buffer);
+    let attack_selected = editor.synth_control == SynthControl::Attack;
+    draw_slider(env_x, attack_bar_y, slider_w, (synth_params.attack - 0.1) / 4.9, attack_selected, buffer);
+    let attack_text = format!("{:.1}s", synth_params.attack);
+    draw_text_left(&attack_text, env_x + slider_w + 5, attack_bar_y, font, value_color, buffer);
+
+    // Release slider
+    let release_label_y = attack_bar_y + row_height - 14;
+    let release_bar_y = release_label_y + 14;
+    draw_text_left("СПАД", env_x, release_label_y, font, label_color, buffer);
+    let release_selected = editor.synth_control == SynthControl::Release;
+    draw_slider(env_x, release_bar_y, slider_w, (synth_params.release - 0.5) / 7.5, release_selected, buffer);
+    let release_text = format!("{:.1}s", synth_params.release);
+    draw_text_left(&release_text, env_x + slider_w + 5, release_bar_y, font, value_color, buffer);
+
+    // === BOTTOM RIGHT: Play/Volume (under envelope section) ===
+    let play_y = content_y + 140;
+    let play_w = 90;
+    let play_h = 28;
+    let play_text = if synth_params.playing { "СТОП" } else { "ПУСК" };
+    draw_button(env_x, play_y, play_w, play_h, play_text, false, synth_params.playing, font, buffer);
+
+    // Volume slider (label above, bar below)
+    let vol_label_y = play_y + play_h + 12;
+    let vol_bar_y = vol_label_y + 14;
+    draw_text_left("ГРОМКОСТЬ", env_x, vol_label_y, font, label_color, buffer);
+    let vol_selected = editor.synth_control == SynthControl::Volume;
+    draw_slider(env_x, vol_bar_y, slider_w, synth_params.volume, vol_selected, buffer);
+    let vol_text = format!("{:.0}%", synth_params.volume * 100.0);
+    draw_text_left(&vol_text, env_x + slider_w + 5, vol_bar_y, font, value_color, buffer);
 }
 
 /// Render the specifications tab content
@@ -4030,34 +4433,133 @@ fn get_clicked_tab(mx: usize, my: usize) -> Option<Tab> {
     }
 }
 
-/// Check which music button was clicked (if any) in the Menu tab
-fn get_clicked_music_button(mx: usize, my: usize) -> Option<MusicTrack> {
+/// Handle synth UI clicks in the Menu tab
+fn handle_synth_click(mx: usize, my: usize, editor: &mut EditorState, synth_params: &Arc<Mutex<SynthParams>>) {
     let content_y = GRID_PIXEL_HEIGHT + HELP_AREA_HEIGHT + TAB_HEIGHT;
-    let btn_x = 10;
-    let btn_w = 180;
-    let btn_h = 28;
-    let btn_spacing = 6;
 
-    // Check if x is within button bounds
-    if mx < btn_x || mx >= btn_x + btn_w {
-        return None;
-    }
+    // Layout constants (must match render_menu_tab)
+    let seq_x = 10;
+    let filter_x = 270;
+    let env_x = 530;
 
-    let tracks = [
-        MusicTrack::None,
-        MusicTrack::AnalogSequence,
-        MusicTrack::GroovyBeat,
-        MusicTrack::RetroLoop,
-    ];
+    let slider_h = 14;
+    let slider_w = 150;
+    let row_height = 36;
 
-    for (i, track) in tracks.iter().enumerate() {
-        let btn_y = content_y + 32 + i * (btn_h + btn_spacing);
-        if my >= btn_y && my < btn_y + btn_h {
-            return Some(*track);
+    // Check chord buttons (4 in a row)
+    let chord_y = content_y + 32;
+    let chord_w = 55;
+    let chord_h = 24;
+    let chord_spacing = 5;
+
+    for i in 0..4 {
+        let btn_x = seq_x + i * (chord_w + chord_spacing);
+        if mx >= btn_x && mx < btn_x + chord_w && my >= chord_y && my < chord_y + chord_h {
+            editor.synth_control = SynthControl::Chord(i);
+            let mut params = synth_params.lock().unwrap();
+            params.chords[i] = params.chords[i].next();
+            return;
         }
     }
 
-    None
+    // Check mode button (no label, on same row as waveform)
+    let mode_y = chord_y + chord_h + 6;
+    if mx >= seq_x && mx < seq_x + 95 && my >= mode_y && my < mode_y + 20 {
+        editor.synth_control = SynthControl::Mode;
+        let mut params = synth_params.lock().unwrap();
+        let new_mode = params.mode.next();
+        params.chords = new_mode.default_chords();
+        params.mode = new_mode;
+        return;
+    }
+
+    // Check waveform button (on same row as mode)
+    if mx >= seq_x + 100 && mx < seq_x + 195 && my >= mode_y && my < mode_y + 20 {
+        editor.synth_control = SynthControl::Waveform;
+        let mut params = synth_params.lock().unwrap();
+        params.waveform = params.waveform.next();
+        return;
+    }
+
+    // Check SEQ sliders (bar is below label)
+    let detune_bar_y = mode_y + 28 + 14;
+    if mx >= seq_x && mx < seq_x + slider_w && my >= detune_bar_y && my < detune_bar_y + slider_h {
+        editor.synth_control = SynthControl::Detune;
+        let ratio = ((mx - seq_x) as f32 / slider_w as f32).clamp(0.0, 1.0);
+        synth_params.lock().unwrap().detune = ratio * 20.0;
+        return;
+    }
+
+    let bpm_bar_y = detune_bar_y + row_height;
+    if mx >= seq_x && mx < seq_x + slider_w && my >= bpm_bar_y && my < bpm_bar_y + slider_h {
+        editor.synth_control = SynthControl::BPM;
+        let ratio = ((mx - seq_x) as f32 / slider_w as f32).clamp(0.0, 1.0);
+        synth_params.lock().unwrap().bpm = 10.0 + ratio * 150.0;
+        return;
+    }
+
+    // Check FILTER sliders (bar is below label)
+    let cutoff_bar_y = content_y + 35 + 14;
+    if mx >= filter_x && mx < filter_x + slider_w && my >= cutoff_bar_y && my < cutoff_bar_y + slider_h {
+        editor.synth_control = SynthControl::Cutoff;
+        let ratio = ((mx - filter_x) as f32 / slider_w as f32).clamp(0.0, 1.0);
+        synth_params.lock().unwrap().filter_cutoff = 200.0 + ratio * 1800.0;
+        return;
+    }
+
+    let lfo_amt_bar_y = cutoff_bar_y + row_height;
+    if mx >= filter_x && mx < filter_x + slider_w && my >= lfo_amt_bar_y && my < lfo_amt_bar_y + slider_h {
+        editor.synth_control = SynthControl::LfoAmount;
+        let ratio = ((mx - filter_x) as f32 / slider_w as f32).clamp(0.0, 1.0);
+        synth_params.lock().unwrap().lfo_amount = ratio;
+        return;
+    }
+
+    let lfo_rate_bar_y = lfo_amt_bar_y + row_height;
+    if mx >= filter_x && mx < filter_x + slider_w && my >= lfo_rate_bar_y && my < lfo_rate_bar_y + slider_h {
+        editor.synth_control = SynthControl::LfoRate;
+        let ratio = ((mx - filter_x) as f32 / slider_w as f32).clamp(0.0, 1.0);
+        synth_params.lock().unwrap().lfo_rate = 0.05 + ratio * 1.95;
+        return;
+    }
+
+    // Check ENVELOPE sliders (bar is below label)
+    let attack_bar_y = content_y + 35 + 14;
+    if mx >= env_x && mx < env_x + slider_w && my >= attack_bar_y && my < attack_bar_y + slider_h {
+        editor.synth_control = SynthControl::Attack;
+        let ratio = ((mx - env_x) as f32 / slider_w as f32).clamp(0.0, 1.0);
+        synth_params.lock().unwrap().attack = 0.1 + ratio * 4.9;
+        return;
+    }
+
+    let release_bar_y = attack_bar_y + row_height;
+    if mx >= env_x && mx < env_x + slider_w && my >= release_bar_y && my < release_bar_y + slider_h {
+        editor.synth_control = SynthControl::Release;
+        let ratio = ((mx - env_x) as f32 / slider_w as f32).clamp(0.0, 1.0);
+        synth_params.lock().unwrap().release = 0.5 + ratio * 7.5;
+        return;
+    }
+
+    // Check play button (bottom right under envelope)
+    let play_y = content_y + 140;
+    let play_w = 90;
+    let play_h = 28;
+    if mx >= env_x && mx < env_x + play_w && my >= play_y && my < play_y + play_h {
+        let mut params = synth_params.lock().unwrap();
+        params.playing = !params.playing;
+        if params.playing {
+            params.chord_trigger = true;
+        }
+        return;
+    }
+
+    // Volume slider (bottom right, bar is below label)
+    let vol_bar_y = play_y + play_h + 12 + 14;
+    if mx >= env_x && mx < env_x + slider_w && my >= vol_bar_y && my < vol_bar_y + slider_h {
+        editor.synth_control = SynthControl::Volume;
+        let ratio = ((mx - env_x) as f32 / slider_w as f32).clamp(0.0, 1.0);
+        synth_params.lock().unwrap().volume = ratio;
+    }
 }
 
 /// Check which panel button was clicked (if any)
