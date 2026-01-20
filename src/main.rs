@@ -1874,6 +1874,12 @@ fn delete_snippet_file(snippet: &Snippet, dir: &PathBuf) -> std::io::Result<()> 
 // ============================================================================
 
 fn main() {
+    // Get executable directory for finding bundled assets
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
     let snippets_dir = if args.len() > 1 {
@@ -1889,7 +1895,13 @@ fn main() {
     let levels_dir = if args.len() > 3 {
         PathBuf::from(&args[3])
     } else {
-        PathBuf::from("levels")
+        // Try exe directory first, then current directory
+        let exe_levels = exe_dir.join("levels");
+        if exe_levels.exists() {
+            exe_levels
+        } else {
+            PathBuf::from("levels")
+        }
     };
     let save_path = PathBuf::from(".save.json");
 
@@ -1902,8 +1914,16 @@ fn main() {
     editor.designs = load_all_snippets(&designs_dir);
     editor.levels = load_all_levels(&levels_dir);
 
-    // Load font for pin labels
-    let font = load_font("terminus/ter-u14b.bdf");
+    // Load font for pin labels (try exe directory first, then current directory)
+    let font_path = {
+        let exe_font = exe_dir.join("terminus/ter-u14b.bdf");
+        if exe_font.exists() {
+            exe_font
+        } else {
+            PathBuf::from("terminus/ter-u14b.bdf")
+        }
+    };
+    let font = load_font(font_path.to_str().unwrap_or("terminus/ter-u14b.bdf"));
 
     // Create pins and place their metal
     let pins = create_pins();
