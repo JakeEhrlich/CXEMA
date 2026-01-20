@@ -19,26 +19,9 @@ https://terminus-font.sourceforge.net/
 The full text of the SIL Open Font License is available at:
 https://scripts.sil.org/OFL
 
-## Music
+## Audio
 
-### CC0 (Public Domain)
-
-**Retro Game Music Loop**
-By ProdByRey
-Source: https://freesound.org/s/715708/
-License: CC0 1.0 Universal (Public Domain)
-
-**Groovy Beat**
-By Seth_Makes_Sounds
-Source: https://freesound.org/s/659748/
-License: CC0 1.0 Universal (Public Domain)
-
-### CC BY 4.0 (Attribution Required)
-
-**Analog Sequence Melody (Am - 140)**
-By Xinematix
-Source: https://freesound.org/s/519187/
-License: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+All audio (music and sound effects) is procedurally generated using synthesis techniques. No external audio samples are used.
 
 ## Adding Attribution
 
